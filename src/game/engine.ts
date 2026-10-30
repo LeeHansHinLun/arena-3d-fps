@@ -184,12 +184,17 @@ interface FHit {
   head: boolean;
 }
 
-/** free geometry + materials of an object tree (shared textures are left alone) */
+/** free geometry + materials of a single object (shared textures are left alone) */
 function freeObject(o: THREE.Object3D) {
   const m = o as THREE.Mesh;
   m.geometry?.dispose();
   const mt = m.material as THREE.Material | THREE.Material[] | undefined;
   if (mt) (Array.isArray(mt) ? mt : [mt]).forEach((x) => x.dispose());
+}
+
+/** free geometry + materials of a whole object tree (dispose() is idempotent, so shared resources are safe) */
+function freeTree(o: THREE.Object3D) {
+  o.traverse(freeObject);
 }
 
 export class Engine {
@@ -329,10 +334,11 @@ export class Engine {
   private chatT = 20;
   private aiCtx!: AICtx;
   private hitFlag = false;
-  private mouseDirty = false;
-  private cameraDirty = true;
+  /** set when the sun direction/position needs to be re-applied even if the shadow cell did not change */
+  private sunDirty = true;
   private lastHudAlive = true;
   private espT = 0;
+  private espLast = 0;
   private espCache: { x: number; y: number; h: number; name: string; d: number; hp: number; shootable: boolean }[] = [];
   private ro: ResizeObserver | null = null;
   private container: HTMLElement;
@@ -470,7 +476,8 @@ export class Engine {
       pickups: this.pickups,
       isEnemy: (a, b) => a !== b && (!this.teamMode || a.team !== b.team),
       fire: (f, t, w) => {
-        if (!this.cheats.botsPassive) this.botFire(f, t, w);
+        // no shooting at all during warmup (damage is off, and explosions would still shove players)
+        if (!this.cheats.botsPassive && !this.warmup && !this.over) this.botFire(f, t, w);
       },
     };
   }
@@ -544,6 +551,7 @@ export class Engine {
     this.sun.castShadow = enabled;
     this.sun.shadow.autoUpdate = false;
     this.sun.shadow.needsUpdate = true;
+    this.sunDirty = true;
     r.toneMappingExposure = s.exposure;
     if (s.post && !this.post) this.post = new PostPipeline(r, s.antialias);
     else if (!s.post && this.post) {
@@ -828,7 +836,12 @@ export class Engine {
     this.sunDir.set(th.sunDir[0], th.sunDir[1], th.sunDir[2]).normalize();
     this.sunBase.copy(this.sunDir);
     this.rayCol.setHex(th.sunColor);
+    // recolors the baked vertex colors of the level boxes / glow, not just the emissive tint
     this.levelObjs.applyTheme(th);
+    // the light direction changed: reposition the sun even if the player did not move
+    this.sunDirty = true;
+    const b = this.player?.body;
+    this.followSun(b?.x ?? 0, b?.z ?? 0);
     this.sun.shadow.needsUpdate = true;
   }
 
@@ -864,13 +877,16 @@ export class Engine {
     this.nav = new Nav(this.world, next.w, next.d);
     this.map = renderLevelMap(next, 256);
     this.spawnNodes = [];
-    this.pickups.forEach((p) => this.scene.remove(p.group));
-    this.pickups = [];
+    this.disposePickups();
     this.setupPickups();
     this.aiCtx.world = this.world;
     this.aiCtx.nav = this.nav;
     this.aiCtx.pickups = this.pickups;
+    // The objectives are tied to the old geometry: drop them before the new arena is used by the AI
+    this.clearSpecialObjectives();
+    this.setupSpecialMode();
     this.sun.shadow.needsUpdate = true;
+    this.sunDirty = true;
     for (const f of this.fighters) {
       if (!f.gone) this.spawnFighter(f, true);
     }
@@ -921,6 +937,13 @@ export class Engine {
     this.post?.dispose();
     this.levelObjs.dispose();
     this.fighters.forEach((f) => f.view?.dispose());
+    this.disposePickups();
+    for (const r of this.rocketPool) {
+      this.scene.remove(r.mesh);
+      freeObject(r.mesh);
+    }
+    this.rocketPool = [];
+    this.clearSpecialObjectives();
     this.sun.shadow.map?.dispose();
     for (const m of [this.fx.particles.mesh, this.fx.tracers.mesh, this.fx.decals.mesh]) freeObject(m);
     (this.fx.decals.mesh.material as THREE.MeshBasicMaterial).map?.dispose();
@@ -930,6 +953,75 @@ export class Engine {
     // release the WebGL context now: browsers cap live contexts, and players join many matches
     this.renderer.forceContextLoss();
     this.canvas.remove();
+  }
+
+  /** Removes and frees every pickup mesh (geometries/materials are recreated by setupPickups). */
+  private disposePickups() {
+    for (const p of this.pickups) {
+      this.scene.remove(p.group);
+      freeTree(p.group);
+    }
+    this.pickups = [];
+    this.aiCtx.pickups = this.pickups;
+  }
+
+  /** Drops the mode-specific objectives (hill, flags, bounty marker) and frees their resources. */
+  private clearSpecialObjectives() {
+    if (this.hillMesh) {
+      this.scene.remove(this.hillMesh);
+      freeTree(this.hillMesh);
+      this.hillMesh = null;
+    }
+    if (this.bountyMarker) {
+      this.scene.remove(this.bountyMarker);
+      freeObject(this.bountyMarker);
+      this.bountyMarker = null;
+    }
+    for (const fl of this.flags) {
+      this.scene.remove(fl.mesh);
+      freeTree(fl.mesh);
+    }
+    this.flags = [];
+    // nobody is carrying a flag any more (the old flag objects are gone)
+    for (const f of this.fighters) f.carrying = -1;
+    this.bountyId = -1;
+    this.aiCtx.bountyId = -1;
+    this.aiCtx.ctf = { flags: this.flags };
+  }
+
+  /**
+   * Clears everything that still points at a fighter that is being removed from the match
+   * (flag carrier slots, other bots' targets, rockets, bounty/aim references).
+   */
+  private forgetFighter(f: Fighter) {
+    for (const fl of this.flags) {
+      if (fl.carrier !== f) continue;
+      fl.carrier = null;
+      fl.x = fl.baseX;
+      fl.z = fl.baseZ;
+      fl.mesh.position.set(fl.x, fl.mesh.position.y, fl.z);
+    }
+    f.carrying = -1;
+    for (const o of this.fighters) {
+      if (o === f) continue;
+      if (o.ai && o.ai.target === f) {
+        o.ai.target = null;
+        o.ai.canSee = false;
+        o.ai.path = [];
+      }
+      if (o.killer === f) o.killer = null;
+    }
+    for (const r of this.rocketPool) {
+      if (!r.active || r.owner !== f) continue;
+      r.active = false;
+      r.mesh.visible = false;
+    }
+    if (this.bountyId === f.id) {
+      this.bountyId = -1;
+      this.aiCtx.bountyId = -1;
+    }
+    if (this.aimResult?.f === f) this.aimResult = null;
+    if (this.aimTarget === f) this.aimTarget = null;
   }
 
   /* ============================================================ match setup */
@@ -960,6 +1052,15 @@ export class Engine {
     this.cheated = Object.values(this.cheats).some(Boolean);
     this.teamScore = [0, 0];
     this.trauma = 0;
+    // transient screen effects must not bleed into the restarted round
+    this.vfx.damage = 0;
+    this.vfx.heal = 0;
+    this.vfx.flash = 0;
+    this.vfx.speed = 0;
+    this.vfx.low = 0;
+    this.vfx.indicators.length = 0;
+    this.aimResult = null;
+    this.aimTarget = null;
     this.fx.particles.clear();
     this.fx.tracers.clear();
     this.fx.decals.clear();
@@ -1000,7 +1101,9 @@ export class Engine {
       }
       return team;
     };
-    const target = this.mode === 'duel' ? 1 : this.botTarget;
+    // Never conjure more opponents than the server's configured player limit allows.
+    const maxOpponents = Math.max(1, this.maxFighters() - 1);
+    const target = this.mode === 'duel' ? 1 : Math.min(this.botTarget, maxOpponents);
     // Never conjure more opponents than the server actually has players for.
     this.minActiveAI = this.coOp ? 6 : Math.min(6, Math.max(1, target));
     for (const prof of this.fakeProfiles.slice(0, target)) {
@@ -1008,9 +1111,12 @@ export class Engine {
     }
     let bi = 0;
     if (seedScores && this.teamplay) {
-      // a match in progress already has team points on the board
-      const t0 = this.fighters.filter((f) => f.team === 0).reduce((n, f) => n + f.kills, 0);
-      const t1 = this.fighters.filter((f) => f.team === 1).reduce((n, f) => n + f.kills, 0);
+      // A match in progress already has team points on the board. CTF scores captures, so it must
+      // be seeded from each fighter's objective score — never from frags.
+      const captures = this.mode === 'ctf';
+      const teamPoints = (team: number) => this.fighters.reduce((n, f) => n + (f.team === team ? (captures ? f.score : f.kills) : 0), 0);
+      const t0 = teamPoints(0);
+      const t1 = teamPoints(1);
       const lim = this.rules.scoreLimit;
       const scale = lim > 0 ? Math.min(1, (lim - 1) / Math.max(1, t0, t1)) : 1;
       this.teamScore = [Math.round(t0 * scale), Math.round(t1 * scale)];
@@ -1023,21 +1129,10 @@ export class Engine {
     } else {
       while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
     }
-    this.bountyId = -1;
-    this.aiCtx.bountyId = -1;
     this.hillAcc = 0;
     this.scoreDirty = true;
     this.scoreCache = [];
-    if (this.hillMesh) {
-      this.scene.remove(this.hillMesh);
-      this.hillMesh = null;
-    }
-    if (this.bountyMarker) {
-      this.scene.remove(this.bountyMarker);
-      this.bountyMarker = null;
-    }
-    this.flags.forEach((f) => this.scene.remove(f.mesh));
-    this.flags = [];
+    this.clearSpecialObjectives();
     this.setupSpecialMode();
     this.aiCtx.fighters = this.fighters;
     for (const f of this.fighters) if (!f.isPlayer) this.spawnFighter(f, true);
@@ -1081,6 +1176,12 @@ export class Engine {
     audio.play('go');
   }
 
+  /** Hard cap on fighters in the world: the server's maxPlayers, never more than the engine limit. */
+  private maxFighters(): number {
+    const configured = this.rules.maxPlayers > 0 ? Math.round(this.rules.maxPlayers) : 120;
+    return Math.max(1, Math.min(120, configured));
+  }
+
   /** Auto skill is rolled once per fighter and then stays with them across respawns. */
   private skillFor(f: Fighter): Difficulty {
     if (this.rules.difficulty !== 'auto') return this.rules.difficulty;
@@ -1110,11 +1211,13 @@ export class Engine {
     f.region = prof?.region ?? pickOf(['EU', 'NA', 'AS', 'SA', 'OC']);
     f.ping = pingFor(this.server.region, f.region);
     f.frustration = prof?.frustration ?? Math.random() * 0.2;
-    // Never seed a score that would already satisfy the win condition of the round.
+    // Never seed a score that would already satisfy the win condition of the round. The score limit
+    // only bounds the metric the mode is actually won with (frags, captures/points or waves).
     const lim = this.rules.scoreLimit;
     const cap = lim > 0 ? lim - 1 : Number.MAX_SAFE_INTEGER;
     const pointsMode = this.mode === 'koth' || this.mode === 'bounty' || this.mode === 'ctf';
-    f.kills = Math.max(0, Math.min(cap, prof?.kills ?? 0));
+    const fragMode = this.mode === 'ffa' || this.mode === 'tdm' || this.mode === 'insta' || this.mode === 'duel';
+    f.kills = Math.max(0, Math.min(fragMode ? cap : Number.MAX_SAFE_INTEGER, prof?.kills ?? 0));
     f.deaths = Math.max(0, prof?.deaths ?? 0);
     f.score = Math.max(0, Math.min(pointsMode ? cap : Number.MAX_SAFE_INTEGER, prof?.score ?? 0));
     f.ai = newAI();
@@ -1204,6 +1307,8 @@ export class Engine {
       audio.play('spawn');
       this.vfx.flash = 0.6;
     } else {
+      // a respawned bot must never flash white from a hit it took before dying
+      if (f.view) f.view.flashT = 0;
       this.sfxAt('spawn', b.x, b.y, b.z, 0.5, 25);
     }
   }
@@ -1244,12 +1349,6 @@ export class Engine {
 
   private step(dt: number) {
     this.frameN++;
-    // Mouse look deltas are accumulated during the frame; mark the camera dirty so the
-    // projection matrix is only rebuilt when the view actually changed.
-    if (this.mouseDirty) {
-      this.mouseDirty = false;
-      this.cameraDirty = true;
-    }
     if (this.state === 'playing') this.simulate(dt, dt);
     else if (this.state === 'over') this.simulate(dt * 0.3, dt);
     else if (this.state === 'intro') this.introStep(dt);
@@ -1372,7 +1471,8 @@ export class Engine {
       while (live < this.minActiveAI && guard++ < this.minActiveAI) {
         // Prefer respawning an existing dead enemy (cheapest), otherwise spawn a fresh bot
         let dead = this.fighters.find((f) => !f.isPlayer && !f.gone && !f.alive && this.aiCtx.isEnemy(this.player, f));
-        if (!dead && this.fighters.length < 120) {
+        const cap = this.coOp ? 120 : this.maxFighters();
+        if (!dead && this.fighters.filter((f) => !f.gone).length < cap) {
           const team = this.teamMode ? (this.player.team === 0 ? 1 : 0) : 0;
           dead = this.makeBot(team, this.fighters.length);
           this.fighters.push(dead);
@@ -1467,11 +1567,20 @@ export class Engine {
     const occ = this.fighters.filter((f) => f.alive && this.inHill(f));
     if (!occ.length) return '';
     if (this.teamplay) {
-      const t0 = occ.filter((f) => f.team === 0).length;
-      const t1 = occ.length - t0;
-      return t0 === t1 ? 'CONTESTED' : t0 > t1 ? 'CYAN' : 'MAGENTA';
+      const t = this.hillTeam(occ);
+      return t < 0 ? 'CONTESTED' : t === 0 ? 'CYAN' : 'MAGENTA';
     }
     return occ.length > 1 ? 'CONTESTED' : occ[0].name;
+  }
+
+  /** Team that owns an uncontested hill, -1 when it is contested or empty. */
+  private hillTeam(occ?: Fighter[]): number {
+    const occ2 = occ ?? this.fighters.filter((f) => f.alive && this.inHill(f));
+    if (!occ2.length) return -1;
+    const t0 = occ2.filter((f) => f.team === 0).length;
+    const t1 = occ2.length - t0;
+    // a tie (including 1v1) is contested, so neither team scores
+    return t0 === t1 ? -1 : t0 > t1 ? 0 : 1;
   }
 
   private flagStatus(): string {
@@ -1486,11 +1595,16 @@ export class Engine {
       this.hillAcc += dt;
       if (this.hillAcc >= 1) {
         this.hillAcc -= 1;
-        const owner = this.hillOwner();
         // one point per second for whoever holds an uncontested hill; contested hills score nothing
-        if (occ.length && owner !== 'CONTESTED') {
-          if (this.teamplay) this.teamScore[occ[0].team] += 1;
-          else occ[0].score += 1;
+        if (this.teamplay) {
+          // score for the team that actually owns the hill, not for whoever happens to be listed first
+          const team = this.hillTeam(occ);
+          if (team >= 0) {
+            this.teamScore[team] += 1;
+            this.scoreDirty = true;
+          }
+        } else if (occ.length === 1) {
+          occ[0].score += 1;
           this.scoreDirty = true;
         }
       }
@@ -1673,6 +1787,7 @@ export class Engine {
           this.scene.remove(f.view.group);
           f.view.dispose();
         }
+        this.forgetFighter(f);
         const idx = this.fighters.indexOf(f);
         const fresh = this.makeFake(f.team, genPlayerName(this.usedNames));
         this.fighters[idx] = fresh;
@@ -1749,16 +1864,18 @@ export class Engine {
   }
 
   private followSun(cx: number, cz: number) {
-    if (!this.sun.castShadow) return;
     const sx = Math.round(cx / 2) * 2;
     const sz = Math.round(cz / 2) * 2;
-    if (sx === this.lastSunX && sz === this.lastSunZ && !this.settings.dynamicSun) return;
+    // Reposition when the shadow cell changes, when the sun animates, or when the theme moved the sun.
+    if (sx === this.lastSunX && sz === this.lastSunZ && !this.settings.dynamicSun && !this.sunDirty) return;
     this.lastSunX = sx;
     this.lastSunZ = sz;
+    this.sunDirty = false;
     this.sun.target.position.set(sx, 0, sz);
     this.sun.position.set(sx + this.sunDir.x * 100, this.sunDir.y * 100, sz + this.sunDir.z * 100);
     this.sun.target.updateMatrixWorld();
-    this.sun.shadow.needsUpdate = true;
+    // with shadows off the light still lights the scene, there is just no shadow map to refresh
+    if (this.sun.castShadow) this.sun.shadow.needsUpdate = true;
   }
 
   /* ========================================================= dynamic lights */
@@ -1837,10 +1954,9 @@ export class Engine {
     this.aiCtx.speedMul = this.speedMul;
     this.aiCtx.insta = this.insta;
     this.aiCtx.mode = this.mode;
-    if (rules.cheats) {
-      this.cheats = { ...rules.cheats };
-      if (Object.values(this.cheats).some(Boolean)) this.cheated = true;
-    }
+    // "cheats off" is represented by a missing cheats block, so an omitted value must clear them
+    this.cheats = rules.cheats ? { ...rules.cheats } : { ...NO_CHEATS };
+    this.cheated = Object.values(this.cheats).some(Boolean);
   }
 
   /** Keeps the engine's view of the server (name, region, motd…) in sync with host edits. */
@@ -1850,7 +1966,8 @@ export class Engine {
 
   setCheats(c: Cheats) {
     this.cheats = { ...c };
-    if (Object.values(c).some(Boolean)) this.cheated = true;
+    // turning every cheat off also clears the "this result was cheated" marker
+    this.cheated = Object.values(c).some(Boolean);
     if (c.oneHp && this.player.alive) {
       this.player.hp = 1;
       this.player.armor = 0;
@@ -1861,6 +1978,10 @@ export class Engine {
     this.rules = { ...this.rules, difficulty: d };
     this.diff = DIFF_PARAMS[d];
     this.aiCtx.diff = this.diff;
+    // already-spawned bots have to pick the new skill up as well, not only fresh respawns
+    for (const f of this.fighters) {
+      if (!f.isPlayer) f.skill = this.skillFor(f);
+    }
     this.emit({ type: 'chat', name: 'SERVER', text: `Bot skill set to ${d}`, team: -1, system: true });
   }
   /** Keeps the round-to-round roster in sync after the host adds or removes players. */
@@ -1870,7 +1991,9 @@ export class Engine {
   }
 
   addBot() {
-    if (this.fighters.length >= 120) return;
+    // respect the server's configured slot count (survival hordes are AI waves, not lobby slots)
+    const cap = this.coOp ? 120 : this.maxFighters();
+    if (this.fighters.filter((f) => !f.gone).length >= cap) return;
     let team = 0;
     if (this.coOp) team = 1;
     else if (this.teamplay) {
@@ -1893,6 +2016,7 @@ export class Engine {
       this.scene.remove(f.view.group);
       f.view.dispose();
     }
+    this.forgetFighter(f);
     this.fighters.splice(idx, 1);
     this.scoreDirty = true;
     this.usedNames.delete(f.name);
@@ -1912,8 +2036,12 @@ export class Engine {
   getEsp(w: number, h: number) {
     const out: { x: number; y: number; h: number; name: string; d: number; hp: number; shootable: boolean }[] = [];
     if (!this.cheats.wallhack || this.state === 'intro') return out;
-    // Throttle the expensive full ESP loop to ~20 Hz; reuse the last cached projection between updates
-    this.espT += 1 / 60;
+    // Throttle the expensive full ESP loop to ~20 Hz of *real* time; reuse the cached projection between updates.
+    // The HUD calls this on every render frame, so the delta has to come from the wall clock, not a fixed step.
+    const now = performance.now();
+    const elapsed = this.espLast ? Math.min(0.25, Math.max(0, (now - this.espLast) / 1000)) : 1 / 60;
+    this.espLast = now;
+    this.espT += elapsed;
     if (this.espT < 0.05) return this.espCache;
     this.espT = 0;
     this.espCache = out;
@@ -1975,7 +2103,8 @@ export class Engine {
     const near = this.nearbyFighters(cam.x, cam.z, 72);
     for (let ni = 0; ni < near.length; ni++) {
       const f = near[ni];
-      if (f.isPlayer || !f.alive || f.gone || (this.teamMode && f.team === p.team)) continue;
+      // spawn-protected fighters are invulnerable: aim assist must not pull toward them (same rule as the aimbot)
+      if (f.isPlayer || !f.alive || f.gone || f.spawnProt > 0 || (this.teamMode && f.team === p.team)) continue;
       const tx = f.body.x, ty = f.body.y + (f.body.h > 1.5 ? 1.15 : 0.75), tz = f.body.z;
       const dx = tx - cam.x, dy = ty - cam.y, dz = tz - cam.z;
       const dh = Math.hypot(dx, dz);
@@ -2142,7 +2271,7 @@ export class Engine {
     this.aimT -= dt;
     const tgt = aa > 0 && this.aimT <= 0 ? (this.aimT = 1 / 30, this.findAimTarget()) : this.aimResult;
     if (aa <= 0) this.aimResult = null;
-    this.aimTarget = tgt ? tgt.f : null;
+    this.aimTarget = tgt && tgt.f.spawnProt <= 0 ? tgt.f : null;
     if (tgt) {
       // slowdown ("friction") near targets
       const close = 1 - tgt.ang / tgt.cone;
@@ -2152,7 +2281,7 @@ export class Engine {
     }
     p.yaw -= dx;
     p.pitch = clamp(p.pitch - dy * (s.invertY ? -1 : 1), -1.5, 1.5);
-    if (tgt && tgt.f.alive) {
+    if (tgt && tgt.f.alive && tgt.f.spawnProt <= 0) {
       // magnetism: only while the player is actively playing (moving, looking or shooting).
       // Angles are recomputed every frame so the pull never lags behind a moving target.
       const fresh = this.aimAngles(tgt.f);
@@ -2600,14 +2729,15 @@ export class Engine {
       const ddx = f.body.x - src.body.x, ddz = f.body.z - src.body.z;
       const d = Math.sqrt(ddx * ddx + ddz * ddz);
       if (d > 55 || f.ai.canSee) continue;
-      if (Math.random() < this.diff.hear * (1 - d / 70) && n < 3) {
+      const dp = this.botParams(f);
+      if (Math.random() < dp.hear * (1 - d / 70) && n < 3) {
         n++;
         f.ai.target = src;
         f.ai.seenT = this.t;
         f.ai.lastX = src.body.x;
         f.ai.lastY = src.body.y;
         f.ai.lastZ = src.body.z;
-        f.ai.reactT = this.diff.react;
+        f.ai.reactT = dp.react;
         f.ai.path = [];
         f.ai.repathT = 0;
       }
@@ -2703,6 +2833,31 @@ export class Engine {
     r.mesh.lookAt(x + dx, y + dy, z + dz);
   }
 
+  /**
+   * First fighter hit by the segment a rocket travels during one frame, as a distance along it.
+   * Sweeping the whole step prevents fast rockets from tunnelling straight through a fighter.
+   */
+  private sweepFighter(ox: number, oy: number, oz: number, ex: number, ey: number, ez: number, owner: Fighter, ignoreOwner: boolean): { f: Fighter; t: number } | null {
+    const dx = ex - ox, dy = ey - oy, dz = ez - oz;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-6) return null;
+    const ux = dx / len, uy = dy / len, uz = dz / len;
+    let best: Fighter | null = null;
+    let bt = len;
+    for (const f of this.fighters) {
+      if (!f.alive || f.gone) continue;
+      if (f === owner && ignoreOwner) continue;
+      if (this.teamMode && f.team === owner.team && f !== owner) continue;
+      const b = f.body;
+      // slightly inflated body box so the rocket does not slip past at the edges
+      const t = rayAABB(ox, oy, oz, ux, uy, uz, b.x - 0.45, b.y - 0.15, b.z - 0.45, b.x + 0.45, b.y + b.h + 0.15, b.z + 0.45);
+      if (t < 0 || t > bt) continue;
+      bt = t;
+      best = f;
+    }
+    return best ? { f: best, t: bt } : null;
+  }
+
   private updateRockets(dt: number) {
     for (const r of this.rocketPool) {
       if (!r.active) continue;
@@ -2712,20 +2867,20 @@ export class Engine {
       const dx = r.vx / sp, dy = r.vy / sp, dz = r.vz / sp;
       const hit: RayHit = { nx: 0, ny: 1, nz: 0 };
       const tw = this.world.raycast(r.x, r.y, r.z, dx, dy, dz, step + 0.15, hit);
-      let boom = tw !== Infinity;
-      let ex = r.x + dx * (boom ? Math.max(0, tw - 0.1) : step);
-      let ey = r.y + dy * (boom ? Math.max(0, tw - 0.1) : step);
-      let ez = r.z + dz * (boom ? Math.max(0, tw - 0.1) : step);
-      if (!boom && r.age > 0.05) {
-        for (const f of this.fighters) {
-          if (!f.alive || f.gone || (f === r.owner && r.age < 0.25)) continue;
-          if (this.teamMode && f.team === r.owner.team && f !== r.owner) continue;
-          const b = f.body;
-          if (ey > b.y - 0.1 && ey < b.y + b.h + 0.1 && Math.hypot(ex - b.x, ez - b.z) < 0.7) {
-            boom = true;
-            break;
-          }
-        }
+      const wallBoom = tw !== Infinity;
+      const swept = r.age > 0.05 ? this.sweepFighter(r.x, r.y, r.z, r.x + dx * step, r.y + dy * step, r.z + dz * step, r.owner, r.age < 0.25) : null;
+      let boom = false;
+      let ex = r.x + dx * step, ey = r.y + dy * step, ez = r.z + dz * step;
+      if (swept && (!wallBoom || swept.t <= tw)) {
+        // a fighter is closer than (or as close as) the wall: detonate right on them
+        boom = true;
+        const st = Math.max(0, Math.min(step, swept.t));
+        ex = r.x + dx * st; ey = r.y + dy * st; ez = r.z + dz * st;
+        hit.nx = -dx; hit.ny = -dy; hit.nz = -dz;
+      } else if (wallBoom) {
+        boom = true;
+        const wt = Math.max(0, tw - 0.1);
+        ex = r.x + dx * wt; ey = r.y + dy * wt; ez = r.z + dz * wt;
       }
       if (boom) {
         r.active = false;
@@ -2757,6 +2912,7 @@ export class Engine {
     const dc = Math.hypot(cam.x - x, cam.y - y, cam.z - z);
     this.addTrauma(clamp(1 - dc / 40, 0, 1) * 0.85);
     this.sfxAt('explosion', x, y, z, 1.1, 90);
+    let enemyHit = false;
     for (const f of this.fighters) {
       if (!f.alive || f.gone) continue;
       const b = f.body;
@@ -2765,6 +2921,7 @@ export class Engine {
       if (d > radius) continue;
       if (this.teamMode && f !== owner && f.team === owner.team) continue;
       if (small && f === owner) continue;
+      if (f !== owner && f.spawnProt <= 0 && !this.warmup && !this.over) enemyHit = true;
       const fall = 1 - d / radius;
       const self = f === owner;
       const nx = (cx - x) / (d || 1), ny = (cy - y) / (d || 1), nz = (cz - z) / (d || 1);
@@ -2779,14 +2936,24 @@ export class Engine {
           this.P.sliding = false;
         }
       }
-      const dm = dmg * (0.2 + 0.8 * fall) * (self ? 0.4 : owner.isPlayer ? 1 : this.diff.dmgMul);
+      const dm = dmg * (0.2 + 0.8 * fall) * (self ? 0.4 : owner.isPlayer ? 1 : this.botParams(owner).dmgMul);
       this.damage(f, dm, owner, false, 'rocket', cx, cy, cz, nx, ny, nz);
     }
+    // a rocket that connected counts as an accuracy hit just like a hitscan hit does
+    if (enemyHit && !small && owner.isPlayer) owner.shotsHit++;
+  }
+
+  /** Difficulty parameters that actually apply to this fighter (per-bot skill for auto difficulty). */
+  private botParams(f: Fighter) {
+    return f.skill && f.skill !== 'auto' ? DIFF_PARAMS[f.skill as Difficulty] : this.diff;
   }
 
   private botFire(f: Fighter, target: Fighter, wid: WeaponId) {
+    if (this.warmup || this.over || this.cheats.botsPassive) return;
     const def = this.defs[wid];
-    const dp = this.diff;
+    // Accuracy, lead and damage follow the individual bot's skill (auto difficulty is rolled per
+    // fighter), exactly like movement and fire cadence in updateBot.
+    const dp = this.botParams(f);
     f.lastShotT = this.t;
     const ex = f.body.x, ey = f.body.y + 1.45, ez = f.body.z;
     const tb = target.body;
@@ -2812,7 +2979,8 @@ export class Engine {
       this.spawnRocket(f, mx, my, mz, dx, dy, dz, def.speed * 0.8);
       return;
     }
-    const pellets = wid === 'shotgun' ? 6 : 1;
+    // fire exactly as many pellets as the weapon definition does (the shotgun has 9, not 6)
+    const pellets = Math.max(1, def.pellets);
     for (let i = 0; i < pellets; i++) {
       let px = dx, py = dy, pz = dz;
       if (pellets > 1) {
@@ -2882,7 +3050,7 @@ export class Engine {
         ai.lastX = src.body.x;
         ai.lastY = src.body.y;
         ai.lastZ = src.body.z;
-        ai.reactT = Math.min(ai.reactT, this.diff.react * 0.5);
+        ai.reactT = Math.min(ai.reactT, this.botParams(t).react * 0.5);
         ai.path = [];
       }
     }
@@ -3167,16 +3335,15 @@ export class Engine {
     }
     cam.position.set(px, b.y + P.eye + bobY - P.landDip + P.stepOff, pz);
     cam.rotation.set(p.pitch + P.recoil + P.kick * 0.012 + shP, p.yaw + P.recoilYaw + shY, roll + shR, 'YXZ');
-    this.cameraDirty = true;
     // fov: only update the projection matrix when the value actually changed beyond a threshold
+    // (moving/rotating the camera only touches the view matrix, not the projection)
     const base = s.fov;
     let fov = base * lerp(1, 0.66, P.aimT) + P.sprintT * 5 + P.slideW * 7 + P.fovPunch + Math.max(0, Math.min(6, (P.hv - 11) * 0.5));
     if (P.dashT > 0) fov += 6;
     P.fovCur = lerp(P.fovCur, fov, Math.min(1, dt * 12));
-    if (Math.abs(cam.fov - P.fovCur) > 0.05 || this.cameraDirty) {
+    if (Math.abs(cam.fov - P.fovCur) > 0.05) {
       cam.fov = P.fovCur;
       cam.updateProjectionMatrix();
-      this.cameraDirty = false;
     }
     this.vfx.fov = (cam.fov * Math.PI) / 180;
     // sun follows

@@ -244,6 +244,10 @@ export class BotView {
     const g = this.group;
     if (!f.alive) {
       g.visible = false;
+      // the update loop early-returns while dead, so the flash timer has to be dropped here:
+      // otherwise a respawned bot pops in bright white
+      this.flashT = 0;
+      this.bodyM.material = this.mat;
       return;
     }
     const b = f.body;

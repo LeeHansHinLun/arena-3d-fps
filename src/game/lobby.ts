@@ -162,13 +162,17 @@ export function lobbyToServer(l: HostedLobby): ServerInfo {
     players: l.members.length,
     ping: userPingTo(c.region, 3),
     motd: c.cheatsOn ? 'Cheats are enabled on this server.' : 'Hosted server. GL HF!',
-    roster: l.members.map((m) => ({
-      name: m.name,
-      score: 0,
-      ping: m.ping,
-      region: m.region ?? c.region,
-      skill: c.difficulty === 'auto' ? undefined : c.difficulty,
-    })),
+    // The roster lists the *other* players on the server: you (the host) spawn as yourself,
+    // so keeping the host here would let the engine spawn a duplicate opponent.
+    roster: l.members
+      .filter((m) => !m.host)
+      .map((m) => ({
+        name: m.name,
+        score: 0,
+        ping: m.ping,
+        region: m.region ?? c.region,
+        skill: c.difficulty === 'auto' ? undefined : c.difficulty,
+      })),
     hosted: true,
     password: !!c.password.trim(),
     createdAt: Date.now(),
