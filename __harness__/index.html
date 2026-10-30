@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>NEON RIOT · harness</title>
+    <script>
+      // deterministic Math.random so every capture is reproducible
+      (function () {
+        let s = 0x2f6e2b1 ^ 12345;
+        Math.random = function () {
+          s ^= s << 13; s >>>= 0;
+          s ^= s >> 17;
+          s ^= s << 5; s >>>= 0;
+          return s / 4294967296;
+        };
+      })();
+    </script>
+    <script type="module" src="./main.tsx"></script>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

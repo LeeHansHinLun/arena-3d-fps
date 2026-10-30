@@ -1,8 +1,7 @@
-import { useEffect, useRef, type ReactNode } from 'react';
-import { cn } from '@/utils/cn';
 import { audio } from '@/game/audio';
 import type { LevelData } from '@/game/levels';
 import { renderLevelMap } from '@/game/levelMesh';
+import type { JsxChild } from './dom';
 
 export const sfx = {
   ui: () => audio.play('ui'),
@@ -12,10 +11,23 @@ export const sfx = {
 
 type Variant = 'primary' | 'cyan' | 'yellow' | 'ghost' | 'danger';
 
-export function Btn({
-  children, onClick, variant = 'primary', size = 'md', className, disabled, title, back,
-}: {
-  children: ReactNode;
+/** Joins class names, dropping falsy values. */
+export function cx(...parts: (string | false | null | undefined)[]): string {
+  return parts.filter(Boolean).join(' ');
+}
+
+const BTN_VARIANT: Record<Variant, string> = {
+  primary: 'bg-neon-pink text-white hover:bg-white hover:text-ink shadow-[0_0_22px_rgba(255,45,149,0.45)]',
+  cyan: 'bg-neon-cyan text-ink hover:bg-white shadow-[0_0_22px_rgba(45,226,255,0.4)]',
+  yellow: 'bg-neon-yellow text-ink hover:bg-white shadow-[0_0_22px_rgba(255,225,77,0.4)]',
+  ghost: 'bg-panel2/80 text-white/90 hover:bg-neon-cyan/20 hover:text-neon-cyan shadow-[inset_0_0_0_1px_rgba(120,100,220,0.5)] hover:shadow-[inset_0_0_0_1px_rgba(45,226,255,0.9)]',
+  danger: 'bg-neon-red/90 text-white hover:bg-white hover:text-ink',
+};
+
+const BTN_SIZE = { sm: 'px-3 py-1.5 text-xs', md: 'px-5 py-2.5 text-sm', lg: 'px-8 py-4 text-lg' };
+
+export function Btn(props: {
+  children?: JsxChild;
   onClick?: () => void;
   variant?: Variant;
   size?: 'sm' | 'md' | 'lg';
@@ -24,53 +36,61 @@ export function Btn({
   title?: string;
   back?: boolean;
 }) {
-  const v: Record<Variant, string> = {
-    primary: 'bg-neon-pink text-white hover:bg-white hover:text-ink shadow-[0_0_22px_rgba(255,45,149,0.45)]',
-    cyan: 'bg-neon-cyan text-ink hover:bg-white shadow-[0_0_22px_rgba(45,226,255,0.4)]',
-    yellow: 'bg-neon-yellow text-ink hover:bg-white shadow-[0_0_22px_rgba(255,225,77,0.4)]',
-    ghost: 'bg-panel2/80 text-white/90 hover:bg-neon-cyan/20 hover:text-neon-cyan shadow-[inset_0_0_0_1px_rgba(120,100,220,0.5)] hover:shadow-[inset_0_0_0_1px_rgba(45,226,255,0.9)]',
-    danger: 'bg-neon-red/90 text-white hover:bg-white hover:text-ink',
-  };
-  const s = { sm: 'px-3 py-1.5 text-xs', md: 'px-5 py-2.5 text-sm', lg: 'px-8 py-4 text-lg' }[size];
+  const variant = props.variant ?? 'primary';
+  const size = props.size ?? 'md';
+  // a disabled button never gets the interactive (hover/active) utilities — the
+  // values below are exactly what the old clsx + tailwind-merge combination produced
+  const flavour = props.disabled
+    ? BTN_VARIANT[variant].split(' ').filter((t) => !t.startsWith('hover:') && !t.startsWith('active:')).join(' ')
+    : BTN_VARIANT[variant];
   return (
     <button
       type="button"
-      title={title}
-      disabled={disabled}
-      onMouseEnter={() => !disabled && sfx.hover()}
+      title={props.title}
+      disabled={props.disabled}
+      onMouseEnter={() => !props.disabled && sfx.hover()}
       onClick={() => {
-        if (disabled) return;
+        if (props.disabled) return;
         audio.init();
-        back ? sfx.back() : sfx.ui();
-        onClick?.();
+        props.back ? sfx.back() : sfx.ui();
+        props.onClick?.();
       }}
-      className={cn(
-        'cut-sm font-display font-bold uppercase tracking-[0.18em] transition-all duration-150 active:scale-95 select-none',
-        v[variant], s,
-        disabled && 'opacity-40 cursor-not-allowed hover:bg-panel2 hover:text-white/90 active:scale-100',
-        className,
+      className={cx(
+        'cut-sm font-display font-bold uppercase tracking-[0.18em] transition-all duration-150',
+        props.disabled ? null : 'active:scale-95',
+        'select-none',
+        flavour,
+        BTN_SIZE[size],
+        !!props.disabled && 'opacity-40 cursor-not-allowed hover:bg-panel2 hover:text-white/90 active:scale-100',
+        props.className,
       )}
     >
-      {children}
+      {props.children}
     </button>
   );
 }
 
-export function Panel({ title, onClose, children, className, right }: { title: string; onClose?: () => void; children: ReactNode; className?: string; right?: ReactNode }) {
+export function Panel(props: {
+  title: string;
+  onClose?: () => void;
+  children?: JsxChild;
+  className?: string;
+  right?: JsxChild;
+}) {
   return (
-    <div className={cn('cut glass neon-border flex flex-col min-h-0 pop-in', className)}>
+    <div className={cx('cut glass neon-border flex flex-col min-h-0 pop-in', props.className)}>
       <div className="flex items-center gap-3 border-b border-line/80 px-5 py-3 shrink-0">
         <span className="h-3 w-3 rotate-45 bg-neon-pink shadow-[0_0_10px_#ff2d95]" />
-        <h2 className="font-display text-base font-extrabold uppercase tracking-[0.25em] text-white sm:text-lg">{title}</h2>
+        <h2 className="font-display text-base font-extrabold uppercase tracking-[0.25em] text-white sm:text-lg">{props.title}</h2>
         <div className="ml-auto flex items-center gap-2">
-          {right}
-          {onClose && (
+          {props.right}
+          {props.onClose && (
             <button
               type="button"
               aria-label="Close"
               onClick={() => {
                 sfx.back();
-                onClose();
+                props.onClose?.();
               }}
               className="h-8 w-8 cut-sm bg-panel2 text-lg leading-none text-white/80 transition hover:bg-neon-pink hover:text-white"
             >
@@ -79,94 +99,104 @@ export function Panel({ title, onClose, children, className, right }: { title: s
           )}
         </div>
       </div>
-      {children}
+      {props.children}
     </div>
   );
 }
 
-export function Modal({ children, onClose, z = 50 }: { children: ReactNode; onClose?: () => void; z?: number }) {
-  useEffect(() => {
-    if (!onClose) return;
-    const h = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', h);
-    return () => window.removeEventListener('keydown', h);
-  }, [onClose]);
+export function Modal(props: { children?: JsxChild; onClose?: () => void; z?: number }) {
   return (
     <div
       className="fixed inset-0 flex items-center justify-center bg-black/70 p-3 backdrop-blur-sm fade-in sm:p-6"
-      style={{ zIndex: z }}
-      onPointerDown={(e) => {
-        if (e.target === e.currentTarget) onClose?.();
+      style={{ zIndex: props.z ?? 50 }}
+      onPointerDown={(e: PointerEvent) => {
+        if (e.target === e.currentTarget) props.onClose?.();
       }}
     >
-      {children}
+      {props.children}
     </div>
   );
 }
 
-export function Slider({ label, value, min, max, step = 0.01, onChange, format, color }: { label: string; value: number; min: number; max: number; step?: number; onChange: (v: number) => void; format?: (v: number) => string; color?: string }) {
-  const pct = ((value - min) / (max - min)) * 100;
+export function Slider(props: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step?: number;
+  onChange: (v: number) => void;
+  format?: (v: number) => string;
+  color?: string;
+}) {
+  const step = props.step ?? 0.01;
+  const pct = ((props.value - props.min) / (props.max - props.min)) * 100;
   return (
     <label className="block py-1.5">
       <div className="mb-0.5 flex items-center justify-between text-sm font-semibold uppercase tracking-wider text-white/80">
-        <span>{label}</span>
-        <span className="font-display text-xs text-neon-cyan">{format ? format(value) : value.toFixed(2)}</span>
+        <span>{props.label}</span>
+        <span className="font-display text-xs text-neon-cyan">{props.format ? props.format(props.value) : props.value.toFixed(2)}</span>
       </div>
       <input
         className="nr"
         type="range"
-        min={min}
-        max={max}
+        min={props.min}
+        max={props.max}
         step={step}
-        value={value}
-        style={{ ['--pct' as string]: pct + '%', ['--fill' as string]: color ?? '#ff2d95' }}
-        onChange={(e) => onChange(parseFloat(e.target.value))}
+        value={props.value}
+        style={{ '--pct': pct + '%', '--fill': props.color ?? '#ff2d95' }}
+        onChange={(e: Event) => props.onChange(parseFloat((e.target as HTMLInputElement).value))}
         onPointerUp={() => sfx.hover()}
       />
     </label>
   );
 }
 
-export function Toggle({ label, value, onChange, hint }: { label: string; value: boolean; onChange: (v: boolean) => void; hint?: string }) {
+export function Toggle(props: { label: string; value: boolean; onChange: (v: boolean) => void; hint?: string }) {
   return (
     <button
       type="button"
       onClick={() => {
         sfx.ui();
-        onChange(!value);
+        props.onChange(!props.value);
       }}
       className="flex w-full items-center justify-between gap-3 py-2 text-left"
     >
       <span>
-        <span className="block text-sm font-semibold uppercase tracking-wider text-white/80">{label}</span>
-        {hint && <span className="block text-xs text-white/40">{hint}</span>}
+        <span className="block text-sm font-semibold uppercase tracking-wider text-white/80">{props.label}</span>
+        {props.hint && <span className="block text-xs text-white/40">{props.hint}</span>}
       </span>
-      <span className={cn('relative h-6 w-12 shrink-0 cut-sm transition-colors', value ? 'bg-neon-pink' : 'bg-panel2 shadow-[inset_0_0_0_1px_rgba(120,100,220,0.6)]')}>
-        <span className={cn('absolute top-1 h-4 w-4 bg-white transition-all', value ? 'left-7' : 'left-1')} />
+      <span className={cx('relative h-6 w-12 shrink-0 cut-sm transition-colors', props.value ? 'bg-neon-pink' : 'bg-panel2 shadow-[inset_0_0_0_1px_rgba(120,100,220,0.6)]')}>
+        <span className={cx('absolute top-1 h-4 w-4 bg-white transition-all', props.value ? 'left-7' : 'left-1')} />
       </span>
     </button>
   );
 }
 
-export function Segmented<T extends string | number>({ label, options, value, onChange, className }: { label?: string; options: { v: T; label: string; color?: string }[]; value: T; onChange: (v: T) => void; className?: string }) {
+export function Segmented<T extends string | number>(props: {
+  label?: string;
+  options: { v: T; label: string; color?: string }[];
+  value: T;
+  onChange: (v: T) => void;
+  className?: string;
+}) {
   return (
-    <div className={cn('py-1.5', className)}>
-      {label && <div className="mb-1 text-sm font-semibold uppercase tracking-wider text-white/80">{label}</div>}
+    <div className={cx('py-1.5', props.className)}>
+      {props.label && <div className="mb-1 text-sm font-semibold uppercase tracking-wider text-white/80">{props.label}</div>}
       <div className="flex flex-wrap gap-1.5">
-        {options.map((o) => (
+        {props.options.map((o) => (
           <button
             key={String(o.v)}
             type="button"
             onClick={() => {
               sfx.ui();
-              onChange(o.v);
+              props.onChange(o.v);
             }}
-            style={value === o.v && o.color ? { backgroundColor: o.color, color: '#0a0518' } : undefined}
-            className={cn(
+            style={props.value === o.v && o.color ? { backgroundColor: o.color, color: '#0a0518' } : undefined}
+            className={cx(
               'cut-sm px-3 py-1.5 font-display text-[11px] font-bold uppercase tracking-widest transition',
-              value === o.v ? 'bg-neon-pink text-white shadow-[0_0_14px_rgba(255,45,149,0.5)]' : 'bg-panel2 text-white/70 hover:text-white shadow-[inset_0_0_0_1px_rgba(120,100,220,0.45)]',
+              props.value === o.v
+                ? 'bg-neon-pink text-white shadow-[0_0_14px_rgba(255,45,149,0.5)]'
+                : 'bg-panel2 text-white/70 hover:text-white shadow-[inset_0_0_0_1px_rgba(120,100,220,0.45)]',
             )}
           >
             {o.label}
@@ -177,37 +207,34 @@ export function Segmented<T extends string | number>({ label, options, value, on
   );
 }
 
-export function Chip({ children, color = '#2de2ff', className }: { children: ReactNode; color?: string; className?: string }) {
+export function Chip(props: { children?: JsxChild; color?: string; className?: string }) {
+  const color = props.color ?? '#2de2ff';
   return (
-    <span className={cn('inline-block px-1.5 py-0.5 font-display text-[10px] font-bold uppercase tracking-wider', className)} style={{ color, boxShadow: `inset 0 0 0 1px ${color}66`, backgroundColor: color + '14' }}>
-      {children}
+    <span
+      className={cx('inline-block px-1.5 py-0.5 font-display text-[10px] font-bold uppercase tracking-wider', props.className)}
+      style={{ color, boxShadow: `inset 0 0 0 1px ${color}66`, backgroundColor: color + '14' }}
+    >
+      {props.children}
     </span>
   );
 }
 
-export function MapPreview({ level, size = 240, className }: { level: LevelData; size?: number; className?: string }) {
-  const ref = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    const c = ref.current;
-    if (!c) return;
-    const m = renderLevelMap(level, size);
-    c.width = m.canvas.width;
-    c.height = m.canvas.height;
-    const g = c.getContext('2d');
-    g?.drawImage(m.canvas, 0, 0);
-  }, [level, size]);
-  return (
-    <div className={cn('flex aspect-square w-full items-center justify-center bg-ink', className)}>
-      <canvas ref={ref} className="block h-auto w-full" />
-    </div>
-  );
+/** Canvas preview of an arena, drawn once when the element is created. */
+export function MapPreview(props: { level: LevelData; size?: number; className?: string }) {
+  const size = props.size ?? 240;
+  const canvas = <canvas className="block h-auto w-full" /> as HTMLCanvasElement;
+  const map = renderLevelMap(props.level, size);
+  canvas.width = map.canvas.width;
+  canvas.height = map.canvas.height;
+  canvas.getContext('2d')?.drawImage(map.canvas, 0, 0);
+  return <div className={cx('flex aspect-square w-full items-center justify-center bg-ink', props.className)}>{canvas}</div>;
 }
 
-export function Logo({ size = 'lg' }: { size?: 'sm' | 'lg' }) {
-  const cls = size === 'lg' ? 'text-5xl sm:text-7xl md:text-8xl' : 'text-2xl';
+export function Logo(props: { size?: 'sm' | 'lg' }) {
+  const cls = (props.size ?? 'lg') === 'lg' ? 'text-5xl sm:text-7xl md:text-8xl' : 'text-2xl';
   return (
     <div className="leading-none">
-      <h1 data-text="NEON RIOT" className={cn('glitch title-glow font-display font-black tracking-[0.06em]', cls)}>
+      <h1 data-text="NEON RIOT" className={cx('glitch title-glow font-display font-black tracking-[0.06em]', cls)}>
         NEON RIOT
       </h1>
     </div>

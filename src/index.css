@@ -1,19 +1,5 @@
-@import "tailwindcss";
-
-@theme {
-  --color-ink: #0a0518;
-  --color-panel: #130a2b;
-  --color-panel2: #1d1042;
-  --color-line: #3a2a70;
-  --color-neon-pink: #ff2d95;
-  --color-neon-cyan: #2de2ff;
-  --color-neon-yellow: #ffe14d;
-  --color-neon-green: #7dff6b;
-  --color-neon-red: #ff3b5c;
-  --color-neon-violet: #a26bff;
-  --font-display: "Orbitron", "Rajdhani", "Bahnschrift", system-ui, sans-serif;
-  --font-body: "Rajdhani", "Bahnschrift", "Segoe UI", system-ui, sans-serif;
-}
+/* design tokens, element reset and the utility layer live in ui.css */
+@import "./styles/ui.css";
 
 html,
 body,
