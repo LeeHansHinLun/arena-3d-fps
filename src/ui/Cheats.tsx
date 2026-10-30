@@ -6,8 +6,8 @@ export function CheatsEditor({ value, onChange, compact }: { value: Cheats; onCh
   const any = Object.values(value).some(Boolean);
   return (
     <div>
-      <div className="mb-1 flex items-center justify-between">
-        <span className="text-xs text-white/50">Cheats only affect the host. Matches with cheats don’t count for high scores.</span>
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="text-xs text-white/50">Cheats only affect the host. Matches with cheats are recorded on a separate Cheats leaderboard.</span>
         {any && (
           <button
             type="button"

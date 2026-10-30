@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { DIFFS, LEVEL_IDS, MODES, MUTATORS, REGIONS, fmtTime, type LevelId, type ModeId, type Mutator, type ServerInfo } from '@/game/types';
 import { MAP_NICE, levelLabel } from '@/game/servers';
-import { getLevel } from '@/game/levels';
+import { getLevel, type LevelData } from '@/game/levels';
 import { Btn, Chip, MapPreview, sfx } from './kit';
+import { MapDetails } from './MapDetails';
 import { cn } from '@/utils/cn';
 
 type SortKey = 'name' | 'mode' | 'map' | 'players' | 'ping';
@@ -54,6 +55,7 @@ export function ServerBrowser({ servers, online, refreshing, onRefresh, onJoin, 
   const [hideFull, setHideFull] = useState(false);
   const [sort, setSort] = useState<{ k: SortKey; dir: 1 | -1 }>({ k: 'ping', dir: 1 });
   const [sel, setSel] = useState<string | null>(null);
+  const [detailsLevel, setDetailsLevel] = useState<LevelData | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewH, setViewH] = useState(600);
   const listRef = useRef<HTMLDivElement>(null);
@@ -234,6 +236,7 @@ export function ServerBrowser({ servers, online, refreshing, onRefresh, onJoin, 
                           <span className="font-display">{s.ip}:{s.port}</span>
                           <span className="lg:hidden"><Chip color={m.color}>{m.short}</Chip></span>
                           <span className="lg:hidden">{levelLabel(s)}</span>
+                          {s.alwaysOnline && <Chip color="#7dff6b">24/7</Chip>}
                           {s.rules.mutator !== 'none' && <Chip color="#a26bff">{MUTATORS[s.rules.mutator].name}</Chip>}
                           {s.hosted && <Chip color="#ffe14d">Your lobby</Chip>}
                           {s.password && <Chip color="#ff3b5c">🔒 Locked</Chip>}
@@ -260,27 +263,42 @@ export function ServerBrowser({ servers, online, refreshing, onRefresh, onJoin, 
         </div>
 
         <div className="cut glass neon-border flex max-h-[44%] min-h-0 flex-col lg:max-h-none lg:w-[24rem]">
-          {selected ? <Detail s={selected} onJoin={() => onJoin(selected)} /> : (
+          {selected ? <Detail s={selected} onJoin={() => onJoin(selected)} onInspect={(lvl) => setDetailsLevel(lvl)} /> : (
             <div className="flex flex-1 items-center justify-center p-8 text-center text-white/45">Select a server to view rules, players and map.</div>
           )}
         </div>
       </div>
+      {detailsLevel && <MapDetails level={detailsLevel} onClose={() => setDetailsLevel(null)} />}
     </div>
   );
 }
 
-function Detail({ s, onJoin }: { s: ServerInfo; onJoin: () => void }) {
+function Detail({ s, onJoin, onInspect }: { s: ServerInfo; onJoin: () => void; onInspect: (lvl: LevelData) => void }) {
   const full = s.players >= s.rules.maxPlayers;
   const m = MODES[s.rules.mode];
   const r = s.rules;
+  const unitLabel =
+    m.unit === 'captures'
+      ? 'Capture limit'
+      : m.unit === 'points'
+        ? 'Point limit'
+        : m.unit === 'bounties'
+          ? 'Bounty limit'
+          : m.unit === 'waves'
+            ? 'Wave limit'
+            : r.mode === 'tdm'
+              ? 'Team limit'
+              : 'Frag limit';
   const rules: [string, string][] = [
     ['Mode', m.name],
     ['Map', levelLabel(s)],
-    [s.rules.mode === 'tdm' ? 'Team limit' : 'Frag limit', String(r.scoreLimit)],
-    ['Time limit', fmtTime(r.timeLimit)],
-    ['Bots', DIFFS[r.difficulty].name],
+    [unitLabel, r.scoreLimit === 0 ? '∞ Infinite' : String(r.scoreLimit)],
+    ['Time limit', r.timeLimit === 0 ? '∞ Infinite' : fmtTime(r.timeLimit)],
+    ['Skill', DIFFS[r.difficulty].name],
     ['Physics', MUTATORS[r.mutator].name],
+    ['Uptime', s.alwaysOnline ? '24/7 Dedicated' : 'Standard'],
   ];
+  const lvl = getLevel(s.level, s.gen);
   return (
     <>
       <div className="flex shrink-0 items-start gap-3 border-b border-line/60 p-4">
@@ -295,7 +313,17 @@ function Detail({ s, onJoin }: { s: ServerInfo; onJoin: () => void }) {
       </div>
       <div className="nscroll min-h-0 flex-1 overflow-y-auto p-4">
         <div className="hidden gap-3 lg:grid lg:grid-cols-[110px_1fr]">
-          <MapPreview level={getLevel(s.level, s.gen)} size={110} className="w-[110px]" />
+          <button
+            type="button"
+            title="Click to inspect map"
+            onClick={() => { sfx.ui(); onInspect(lvl); }}
+            className="group relative w-[110px] overflow-hidden text-left shadow-[0_0_0_1px_rgba(45,226,255,0.4)] hover:shadow-[0_0_0_2px_#2de2ff]"
+          >
+            <MapPreview level={lvl} size={110} className="w-[110px]" />
+            <span className="block bg-ink/85 py-0.5 text-center font-display text-[8px] font-bold uppercase tracking-wider text-neon-cyan group-hover:bg-neon-cyan group-hover:text-ink">
+              🔍 Inspect
+            </span>
+          </button>
           <div className="grid content-start gap-1 text-xs">
             {rules.map(([k, v]) => (
               <div key={k} className="flex justify-between gap-2 border-b border-line/30 pb-0.5">

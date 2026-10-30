@@ -8,12 +8,24 @@ import { cn } from '@/utils/cn';
 
 export function RuleChips({ server }: { server: ServerInfo }) {
   const r = server.rules;
+  const unit =
+    MODES[r.mode].unit === 'captures'
+      ? 'Capture limit'
+      : MODES[r.mode].unit === 'points'
+        ? 'Point limit'
+        : MODES[r.mode].unit === 'bounties'
+          ? 'Bounty limit'
+          : MODES[r.mode].unit === 'waves'
+            ? 'Wave limit'
+            : r.mode === 'tdm'
+              ? 'Team limit'
+              : 'Frag limit';
   return (
     <div className="flex flex-wrap justify-center gap-1.5">
       <Chip color={MODES[r.mode].color}>{MODES[r.mode].name}</Chip>
-      <Chip color="#ffe14d">{r.mode === 'tdm' ? 'Team limit' : 'Frag limit'} {r.scoreLimit}</Chip>
-      <Chip color="#2de2ff">{fmtTime(r.timeLimit)}</Chip>
-      <Chip color={DIFFS[r.difficulty].color}>Bots · {DIFFS[r.difficulty].name}</Chip>
+      <Chip color="#ffe14d">{unit} {r.scoreLimit === 0 ? '∞' : r.scoreLimit}</Chip>
+      <Chip color="#2de2ff">{r.timeLimit === 0 ? '∞ Time' : fmtTime(r.timeLimit)}</Chip>
+      <Chip color={DIFFS[r.difficulty].color}>Skill · {DIFFS[r.difficulty].name}</Chip>
       {r.mutator !== 'none' && <Chip color="#a26bff">{MUTATORS[r.mutator].name}</Chip>}
     </div>
   );
@@ -91,7 +103,25 @@ export function DeployOverlay({ server, touch, onDeploy }: { server: ServerInfo;
 }
 
 /* ---------------------------------------------------------------- pause */
-export function PauseOverlay({ server, onResume, onRestart, onSettings, onLeave, onHost }: { server: ServerInfo; onResume: () => void; onRestart: () => void; onSettings: () => void; onLeave: () => void; onHost?: () => void }) {
+export function PauseOverlay({
+  server,
+  warmup,
+  onResume,
+  onStartMatch,
+  onRestart,
+  onSettings,
+  onLeave,
+  onHost,
+}: {
+  server: ServerInfo;
+  warmup?: boolean;
+  onResume: () => void;
+  onStartMatch?: () => void;
+  onRestart: () => void;
+  onSettings: () => void;
+  onLeave: () => void;
+  onHost?: () => void;
+}) {
   const fs = () => {
     try {
       if (document.fullscreenElement) void document.exitFullscreen();
@@ -110,8 +140,9 @@ export function PauseOverlay({ server, onResume, onRestart, onSettings, onLeave,
           </div>
           <div className="flex flex-col gap-2.5">
             <Btn size="lg" onClick={onResume}>Resume</Btn>
+            {warmup && onStartMatch && <Btn variant="primary" onClick={onStartMatch}>▶ Start match</Btn>}
             {onHost && <Btn variant="cyan" onClick={onHost}>★ Host options</Btn>}
-            <Btn variant="yellow" onClick={onRestart}>Restart match</Btn>
+            <Btn variant="yellow" onClick={onRestart}>{warmup ? 'Respawn warmup' : 'Restart match'}</Btn>
             <div className="grid grid-cols-2 gap-2.5">
               <Btn variant="ghost" onClick={onSettings}>Settings</Btn>
               <Btn variant="ghost" onClick={fs}>Fullscreen</Btn>
@@ -162,7 +193,9 @@ export function GameOverOverlay({
             {result.winnerName.startsWith('WAVE') ? `Reached ${result.winnerName}` : `${result.winnerName} wins`} · {result.reason === 'time' ? 'time limit' : result.reason === 'death' ? 'overrun' : 'score limit'} · you placed #{result.rank} of {result.total}
           </div>
           {result.cheated && (
-            <div className="mx-auto mt-2 inline-block cut-sm bg-neon-red px-4 py-1 font-display text-xs font-black uppercase tracking-[0.25em] text-white">Cheats were used · score not recorded</div>
+            <div className="mx-auto mt-2 inline-block cut-sm bg-neon-red px-4 py-1 font-display text-xs font-black uppercase tracking-[0.25em] text-white">
+              Cheats active · recorded on Cheats leaderboard{placed > 0 ? ` (#${placed})` : ''}
+            </div>
           )}
           {!result.cheated && placed > 0 && placed <= 10 && (
             <div className="mx-auto mt-2 inline-block cut-sm bg-neon-yellow px-4 py-1 font-display text-xs font-black uppercase tracking-[0.25em] text-ink">
@@ -198,7 +231,9 @@ export function GameOverOverlay({
             </table>
           </div>
           <div className="flex min-h-0 flex-col">
-            <div className="font-display text-[10px] font-bold uppercase tracking-[0.25em] text-white/50">Local high scores</div>
+            <div className="font-display text-[10px] font-bold uppercase tracking-[0.25em] text-white/50">
+              {result.cheated ? 'Local high scores (Cheats)' : 'Local high scores'}
+            </div>
             <div className="nscroll mt-1 max-h-72 overflow-auto bg-panel/50">
               <ScoreTable rows={top} highlight={placed} limit={8} />
             </div>

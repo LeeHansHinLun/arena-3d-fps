@@ -2,6 +2,7 @@ import type { ScoreEntry, Settings } from './types';
 
 const SKEY = 'neonriot.settings.v1';
 const HKEY = 'neonriot.scores.v1';
+const HKEY_CHEAT = 'neonriot.scores.cheated.v1';
 const PKEY = 'neonriot.profile.v1';
 
 export function detectTouch(): boolean {
@@ -52,6 +53,7 @@ export function defaultSettings(touch = detectTouch()): Settings {
     atmosphere: 0.5,
     movement: 'classic',
     peek: true,
+    aimbotTarget: 'smart',
   };
 }
 
@@ -74,9 +76,9 @@ export function saveSettings(s: Settings) {
   }
 }
 
-export function loadScores(): ScoreEntry[] {
+export function loadScores(cheated = false): ScoreEntry[] {
   try {
-    const raw = localStorage.getItem(HKEY);
+    const raw = localStorage.getItem(cheated ? HKEY_CHEAT : HKEY);
     if (raw) {
       const arr = JSON.parse(raw);
       if (Array.isArray(arr)) return arr;
@@ -87,24 +89,25 @@ export function loadScores(): ScoreEntry[] {
   return [];
 }
 
-/** Adds a score, returns the 1-based rank in the table (or 0 if it did not place). */
-export function addScore(e: ScoreEntry): number {
-  const all = loadScores();
-  all.push(e);
+/** Adds a score to either the standard or cheats leaderboard; returns the 1-based rank (or 0). */
+export function addScore(e: ScoreEntry, cheated = !!e.cheated): number {
+  const entry: ScoreEntry = { ...e, cheated };
+  const all = loadScores(cheated);
+  all.push(entry);
   all.sort((a, b) => b.score - a.score || a.date - b.date);
   const top = all.slice(0, 25);
   try {
-    localStorage.setItem(HKEY, JSON.stringify(top));
+    localStorage.setItem(cheated ? HKEY_CHEAT : HKEY, JSON.stringify(top));
   } catch {
     /* ignore */
   }
-  const idx = top.findIndex((x) => x === e || (x.date === e.date && x.score === e.score && x.name === e.name));
+  const idx = top.findIndex((x) => x === entry || (x.date === entry.date && x.score === entry.score && x.name === entry.name));
   return idx >= 0 ? idx + 1 : 0;
 }
 
-export function clearScores() {
+export function clearScores(cheated = false) {
   try {
-    localStorage.removeItem(HKEY);
+    localStorage.removeItem(cheated ? HKEY_CHEAT : HKEY);
   } catch {
     /* ignore */
   }

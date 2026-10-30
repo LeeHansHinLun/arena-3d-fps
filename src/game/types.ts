@@ -5,9 +5,12 @@ export type LevelId = 'plaza' | 'yard' | 'skyline' | 'colosseum' | 'procedural';
 export type MapSize = 'small' | 'medium' | 'large' | 'huge';
 export type BuiltinLevelId = Exclude<LevelId, 'procedural'>;
 export type WeaponId = 'rifle' | 'shotgun' | 'rail' | 'rocket';
+export type AimbotTarget = 'closest' | 'health' | 'screen' | 'screen-first' | 'smart';
 
 export interface Cheats {
   god: boolean;
+  oneHp: boolean;
+  aimbot: boolean;
   infiniteAmmo: boolean;
   rapidFire: boolean;
   oneShot: boolean;
@@ -19,17 +22,40 @@ export interface Cheats {
   botsPassive: boolean;
 }
 
-export const NO_CHEATS: Cheats = { god: false, infiniteAmmo: false, rapidFire: false, oneShot: false, noRecoil: false, speed: false, moonJump: false, wallhack: false, explosive: false, botsPassive: false };
+export const NO_CHEATS: Cheats = {
+  god: false,
+  oneHp: false,
+  aimbot: false,
+  infiniteAmmo: false,
+  rapidFire: false,
+  oneShot: false,
+  noRecoil: false,
+  speed: false,
+  moonJump: false,
+  wallhack: false,
+  explosive: false,
+  botsPassive: false,
+};
+
+export const AIMBOT_TARGETS: { v: AimbotTarget; label: string; desc: string }[] = [
+  { v: 'closest', label: 'Closest (3D)', desc: 'Always lock onto the enemy closest to you in 3D space' },
+  { v: 'health', label: 'Lowest HP', desc: 'Prioritizes the enemy with the lowest current health' },
+  { v: 'screen', label: 'On-screen only', desc: 'Only locks onto enemies currently visible on screen' },
+  { v: 'screen-first', label: 'On-screen first', desc: 'Prefers on-screen enemies, falls back to any enemy' },
+  { v: 'smart', label: 'Smart', desc: 'Weighs distance, screen proximity, health and visibility together' },
+];
 
 export const CHEAT_INFO: { k: keyof Cheats; name: string; desc: string }[] = [
   { k: 'god', name: 'God mode', desc: 'You take no damage' },
+  { k: 'oneHp', name: '1 HP lock', desc: 'Locks your health at 1 HP and prevents death' },
+  { k: 'aimbot', name: 'Aimbot', desc: 'Snaps to a target with movement prediction when firing (configure targeting in Settings → Controls)' },
   { k: 'infiniteAmmo', name: 'Infinite ammo', desc: 'Never reload again' },
   { k: 'rapidFire', name: 'Rapid fire', desc: '3× fire rate, every gun is automatic' },
   { k: 'oneShot', name: 'One-shot kills', desc: 'Any hit is lethal' },
   { k: 'noRecoil', name: 'No recoil / spread', desc: 'Laser-accurate weapons' },
   { k: 'speed', name: 'Super speed', desc: '+60% movement speed' },
   { k: 'moonJump', name: 'Moon jump', desc: 'Huge jumps and infinite air jumps' },
-  { k: 'wallhack', name: 'Wallhack (ESP)', desc: 'See enemies through walls' },
+  { k: 'wallhack', name: 'Wallhack (ESP)', desc: 'See enemies through walls (green when shootable)' },
   { k: 'explosive', name: 'Explosive rounds', desc: 'Every bullet impact explodes' },
   { k: 'botsPassive', name: 'Passive bots', desc: 'Bots never shoot' },
 ];
@@ -76,6 +102,7 @@ export interface ServerInfo {
   hosted?: boolean;
   password?: boolean;
   createdAt?: number;
+  alwaysOnline?: boolean;
 }
 
 export interface Settings {
@@ -114,6 +141,7 @@ export interface Settings {
   movement: 'classic' | 'flow';
   peek: boolean;
   showFps: boolean;
+  aimbotTarget: AimbotTarget;
 }
 
 export interface ScoreEntry {
@@ -127,6 +155,7 @@ export interface ScoreEntry {
   server: string;
   won: boolean;
   date: number;
+  cheated?: boolean;
 }
 
 export const MODES: Record<ModeId, { name: string; short: string; desc: string; limits: number[]; color: string; team?: boolean; special?: boolean; unit?: string }> = {
@@ -136,8 +165,8 @@ export const MODES: Record<ModeId, { name: string; short: string; desc: string; 
   duel: { name: 'Duel', short: '1V1', desc: 'One opponent, no excuses. First to the frag limit.', limits: [5, 10, 15], color: '#a26bff' },
   ctf: { name: 'Capture the Flag', short: 'CTF', desc: 'Grab the enemy flag and bring it home. Team captures win.', limits: [3, 5, 8], color: '#2de2ff', team: true, special: true, unit: 'captures' },
   koth: { name: 'King of the Hill', short: 'KOTH', desc: 'Hold the glowing hill to bank points. First to the limit wins.', limits: [60, 120, 180], color: '#ffe14d', special: true, unit: 'points' },
-  survival: { name: 'Survival', short: 'SURV', desc: 'Endless waves. Every wave is tougher. How long can you last?', limits: [5, 10, 15], color: '#7dff6b', special: true, unit: 'waves' },
-  bounty: { name: 'Bounty', short: 'BOUNTY', desc: 'One pilot is marked. Hunt them down for bonus points.', limits: [10, 20, 30], color: '#ff3b5c', special: true },
+  survival: { name: 'Survival', short: 'SURV', desc: 'Co-op wave survival. Fight off waves of hostile AI together.', limits: [5, 10, 15], color: '#7dff6b', special: true, unit: 'waves' },
+  bounty: { name: 'Bounty', short: 'BOUNTY', desc: 'One pilot is marked. Only hunting the marked target scores points.', limits: [5, 10, 15], color: '#ff3b5c', special: true, unit: 'bounties' },
 };
 
 export const MODE_ORDER: ModeId[] = ['ffa', 'tdm', 'insta', 'duel', 'ctf', 'koth', 'bounty', 'survival'];

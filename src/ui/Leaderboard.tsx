@@ -2,7 +2,7 @@ import { useState } from 'react';
 import { clearScores, loadProfile, loadScores } from '@/game/storage';
 import { MODES, type ScoreEntry } from '@/game/types';
 import { MAP_NICE } from '@/game/servers';
-import { Btn, Chip, Modal, Panel } from './kit';
+import { Btn, Chip, Modal, Panel, sfx } from './kit';
 import { cn } from '@/utils/cn';
 
 export function ScoreTable({ rows, highlight, limit }: { rows: ScoreEntry[]; highlight?: number; limit?: number }) {
@@ -46,9 +46,16 @@ export function ScoreTable({ rows, highlight, limit }: { rows: ScoreEntry[]; hig
 }
 
 export function Leaderboard({ onClose }: { onClose: () => void }) {
-  const [rows, setRows] = useState(loadScores());
+  const [cheatedTab, setCheatedTab] = useState(false);
+  const [rows, setRows] = useState(() => loadScores(false));
   const [confirm, setConfirm] = useState(false);
   const p = loadProfile();
+  const switchTab = (cheated: boolean) => {
+    sfx.ui();
+    setCheatedTab(cheated);
+    setRows(loadScores(cheated));
+    setConfirm(false);
+  };
   return (
     <Modal onClose={onClose}>
       <Panel title="Hall of Fame" onClose={onClose} className="max-h-[90vh] w-full max-w-3xl">
@@ -65,6 +72,29 @@ export function Leaderboard({ onClose }: { onClose: () => void }) {
             </div>
           ))}
         </div>
+        <div className="flex shrink-0 items-center gap-2 border-b border-line/60 px-4 py-2">
+          <button
+            type="button"
+            onClick={() => switchTab(false)}
+            className={cn(
+              'cut-sm px-3.5 py-1.5 font-display text-[11px] font-bold uppercase tracking-[0.2em] transition',
+              !cheatedTab ? 'bg-neon-cyan text-ink shadow-[0_0_14px_rgba(45,226,255,0.45)]' : 'bg-panel2 text-white/60 hover:text-white',
+            )}
+          >
+            Standard
+          </button>
+          <button
+            type="button"
+            onClick={() => switchTab(true)}
+            className={cn(
+              'cut-sm px-3.5 py-1.5 font-display text-[11px] font-bold uppercase tracking-[0.2em] transition',
+              cheatedTab ? 'bg-neon-red text-white shadow-[0_0_14px_rgba(255,59,92,0.45)]' : 'bg-panel2 text-white/60 hover:text-white',
+            )}
+          >
+            Cheats (sv_cheats)
+          </button>
+          <span className="ml-auto text-xs text-white/40">{cheatedTab ? 'Matches played with cheats enabled' : 'Official unassisted records'}</span>
+        </div>
         <div className="nscroll min-h-0 flex-1 overflow-auto">
           <ScoreTable rows={rows} />
         </div>
@@ -72,11 +102,11 @@ export function Leaderboard({ onClose }: { onClose: () => void }) {
           <span className="text-xs text-white/40">Stored locally in your browser</span>
           {confirm ? (
             <div className="flex gap-2">
-              <Btn size="sm" variant="danger" onClick={() => { clearScores(); setRows([]); setConfirm(false); }}>Really clear</Btn>
+              <Btn size="sm" variant="danger" onClick={() => { clearScores(cheatedTab); setRows([]); setConfirm(false); }}>Really clear</Btn>
               <Btn size="sm" variant="ghost" back onClick={() => setConfirm(false)}>Cancel</Btn>
             </div>
           ) : (
-            <Btn size="sm" variant="ghost" disabled={!rows.length} onClick={() => setConfirm(true)}>Clear table</Btn>
+            <Btn size="sm" variant="ghost" disabled={!rows.length} onClick={() => setConfirm(true)}>Clear {cheatedTab ? 'cheats ' : ''}table</Btn>
           )}
         </div>
       </Panel>

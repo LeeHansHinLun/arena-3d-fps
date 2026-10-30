@@ -24,6 +24,7 @@ export interface AICtx {
   isEnemy(a: Fighter, b: Fighter): boolean;
   fire(f: Fighter, target: Fighter, weapon: WeaponId): void;
   mode?: string;
+  warmup?: boolean;
   hill?: { x: number; z: number; r: number };
   ctf?: { flags: { x: number; z: number; team: number; baseX: number; baseZ: number }[] };
   bountyId?: number;
@@ -67,10 +68,12 @@ function scan(c: AICtx, f: Fighter) {
     const alerted = c.time - e.lastShotT < 1.2 && d < 45;
     if (!alerted && d > 7 && (dx * fx + dz * fz) / (d || 1) < 0) continue;
     const d3 = Math.hypot(d, dy) || 0.01;
-    if (d3 >= bd) continue;
+    // In Bounty mode, strongly prefer targeting the marked bounty (or defending against hunters if we are the bounty)
+    const effDist = c.mode === 'bounty' && e.id === c.bountyId ? d3 * 0.25 : d3;
+    if (effDist >= bd) continue;
     if (c.world.raycast(ex, ey, ez, dx / d3, dy / d3, dz / d3, d3 - 0.3) !== Infinity) continue;
     best = e;
-    bd = d3;
+    bd = effDist;
   }
   if (best) {
     if (ai.target !== best) {
@@ -135,6 +138,13 @@ function newRoamGoal(c: AICtx, f: Fighter) {
     ensurePath(c, f, c.hill.x + (Math.random() - 0.5) * 4, 0, c.hill.z + (Math.random() - 0.5) * 4, true);
     return;
   }
+  if (c.mode === 'bounty' && c.bountyId !== undefined && c.bountyId >= 0 && f.id !== c.bountyId) {
+    const bt = c.fighters.find((x) => x.id === c.bountyId && x.alive);
+    if (bt) {
+      ensurePath(c, f, bt.body.x, bt.body.y, bt.body.z, true);
+      return;
+    }
+  }
   if (f.hp < 60) {
     const hp = live.filter((p) => p.type === 'health');
     if (hp.length) {
@@ -187,8 +197,12 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
     ai.path = [];
   }
   if (ai.scanT <= 0 && lod < 2) {
-    ai.scanT = (0.2 + Math.random() * 0.12) * (lod === 1 ? 2.5 : 1);
-    scan(c, f);
+    ai.scanT = (0.2 + Math.random() * 0.12) * (lod === 1 ? 2.5 : 1) * (c.warmup ? 2.2 : 1);
+    if (!c.warmup || Math.random() < 0.25) scan(c, f);
+    else {
+      ai.target = null;
+      ai.canSee = false;
+    }
   }
 
   const tgt = ai.target;
@@ -291,6 +305,8 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
     dvz = (wz / len) * s;
     if (!fight) desiredYaw = Math.atan2(-wx, -wz);
   }
+  ai.wantX = dvx;
+  ai.wantZ = dvz;
   const k = b.onGround ? Math.min(1, 14 * dt) : Math.min(1, 2.5 * dt);
   b.vx += (dvx - b.vx) * k;
   b.vz += (dvz - b.vz) * k;

@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { audio, type Sfx } from './audio';
 import { Input } from './input';
-import { getLevel, mulberry32, type LevelData } from './levels';
+import { getLevel, mulberry32, type LevelData, type Theme } from './levels';
 import { buildLevelObjects, renderLevelMap, type LevelMap, type LevelObjects } from './levelMesh';
 import { World, rayAABB, raySphere, type RayHit } from './world';
 import { Nav } from './nav';
@@ -9,8 +9,8 @@ import { Blasts, Decals, Particles, Tracers } from './fx';
 import { WEAPONS, WEAPON_ORDER, buildViewModel, type ViewModel, type WeaponDef } from './weapons';
 import { BotView, Fighter, newAI } from './fighter';
 import { updateBot, type AICtx, type PickupLite } from './ai';
-import { DIFF_PARAMS, NO_CHEATS, isTeamMode, type Cheats, type Difficulty, type ModeId, type Rules, type ServerInfo, type Settings, type WeaponId } from './types';
-import { pingFor } from './serverSim';
+import { DIFF_PARAMS, NO_CHEATS, isTeamMode, type Cheats, type Difficulty, type LevelId, type ModeId, type Rules, type ServerInfo, type Settings, type WeaponId } from './types';
+import { pingFor, userPingTo } from './serverSim';
 import { PostPipeline } from './post';
 import { chatLine, genBotName, genPlayerName, pickOf, type ChatKind } from './names';
 
@@ -63,6 +63,7 @@ export interface HudState {
   leaderScore: number;
   bountyRel: number | null;
   bountyDist: number;
+  warmup: boolean;
 }
 
 export type GameEvent =
@@ -129,6 +130,7 @@ export interface EngineOptions {
   handlers: EngineHandlers;
   fakeProfiles?: FakeProfile[];
   botCount?: number;
+  warmup?: boolean;
 }
 
 const R = 0.3;
@@ -187,6 +189,7 @@ export class Engine {
   wScene = new THREE.Scene();
   wCam: THREE.PerspectiveCamera;
   canvas: HTMLCanvasElement;
+  hemi: THREE.HemisphereLight;
   sun: THREE.DirectionalLight;
   sunDir = new THREE.Vector3();
   levelObjs: LevelObjects;
@@ -224,8 +227,19 @@ export class Engine {
   private levelT = 0;
   private chatBudget = 0;
   private lowQuality = false;
+  warmup = false;
+  boardOpen = false;
+  boardScroll = 0;
+  minActiveAI = 6;
+  private liveAIT = 0;
   // special modes
   mode: ModeId = 'ffa';
+  get coOp(): boolean {
+    return this.mode === 'survival';
+  }
+  get teamMode(): boolean {
+    return this.teamplay || this.coOp;
+  }
   hillPos = new THREE.Vector3();
   hillR = 6;
   private hillMesh: THREE.Group | null = null;
@@ -233,7 +247,6 @@ export class Engine {
   wave = 1;
   private waveKills = 0;
   bountyId = -1;
-  private bountyT = 0;
   private bountyMarker: THREE.Mesh | null = null;
   private flags: { team: number; x: number; z: number; baseX: number; baseZ: number; carrier: Fighter | null; mesh: THREE.Group }[] = [];
   private flagT = 0;
@@ -298,6 +311,11 @@ export class Engine {
   private chatT = 20;
   private aiCtx!: AICtx;
   private hitFlag = false;
+  private mouseDirty = false;
+  private cameraDirty = true;
+  private lastHudAlive = true;
+  private espT = 0;
+  private espCache: { x: number; y: number; h: number; name: string; d: number; hp: number; shootable: boolean }[] = [];
   private ro: ResizeObserver | null = null;
   private container: HTMLElement;
   private introAngle = Math.random() * 6;
@@ -318,6 +336,7 @@ export class Engine {
     this.rules = opts.server.rules;
     this.handlers = opts.handlers;
     this.touch = opts.touch;
+    this.warmup = !!opts.warmup;
     this.mode = this.rules.mode;
     this.teamplay = isTeamMode(this.rules.mode);
     this.insta = this.rules.mode === 'insta';
@@ -347,7 +366,8 @@ export class Engine {
     this.wCam = new THREE.PerspectiveCamera(58, 1, 0.01, 10);
 
     // lights
-    this.scene.add(new THREE.HemisphereLight(th.hemiSky, th.hemiGround, 2.6));
+    this.hemi = new THREE.HemisphereLight(th.hemiSky, th.hemiGround, 2.6);
+    this.scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight(th.lightColor, 3.4);
     this.sunDir.set(th.sunDir[0], th.sunDir[1], th.sunDir[2]).normalize();
     this.sunBase.copy(this.sunDir);
@@ -427,9 +447,10 @@ export class Engine {
       speedMul: this.speedMul,
       insta: this.insta,
       mode: this.mode,
+      warmup: this.warmup,
       hill: { x: 0, z: 0, r: this.hillR },
       pickups: this.pickups,
-      isEnemy: (a, b) => a !== b && (!this.teamplay || a.team !== b.team),
+      isEnemy: (a, b) => a !== b && (!this.teamMode || a.team !== b.team),
       fire: (f, t, w) => {
         if (!this.cheats.botsPassive) this.botFire(f, t, w);
       },
@@ -618,8 +639,13 @@ export class Engine {
     this.on(window, 'mouseup', ((e: MouseEvent) => this.input.mouseButton(e.button, false)) as EventListener);
     this.on(this.canvas, 'contextmenu', ((e: Event) => e.preventDefault()) as EventListener);
     this.on(window, 'wheel', ((e: WheelEvent) => {
+      if (this.boardOpen && (this.state === 'playing' || this.state === 'over')) {
+        e.preventDefault();
+        this.boardScroll += e.deltaY;
+        return;
+      }
       if (this.state === 'playing') this.input.wheel += Math.sign(e.deltaY);
-    }) as EventListener, { passive: true });
+    }) as EventListener, { passive: false });
     this.on(document, 'pointerlockchange', (() => {
       const locked = document.pointerLockElement === this.canvas;
       this.locked = locked;
@@ -649,7 +675,10 @@ export class Engine {
     const gameKeys = ['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
     if ((this.state === 'playing' || this.state === 'over') && gameKeys.includes(code)) e.preventDefault();
     if (code === 'Tab') {
-      if (this.state === 'playing' || this.state === 'over') this.handlers.onEvent({ type: 'scoreboard', show: down });
+      if (this.state === 'playing' || this.state === 'over') {
+        this.boardOpen = down;
+        this.handlers.onEvent({ type: 'scoreboard', show: down });
+      }
       return;
     }
     if (!down) {
@@ -726,9 +755,78 @@ export class Engine {
   pause() {
     if (this.state !== 'playing') return;
     this.input.releaseAll();
+    this.boardOpen = false;
+    this.handlers.onEvent({ type: 'scoreboard', show: false });
     this.state = 'paused';
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
     this.setState('paused');
+  }
+
+  /** Transitions from pre-match warmup directly into a live match. */
+  startMatchFromWarmup() {
+    this.warmup = false;
+    this.aiCtx.warmup = false;
+    this.startMatch();
+    if (this.state !== 'playing') this.requestPlay();
+  }
+
+  /** Applies a new theme to sky, fog, sun and level materials in-place without respawning players. */
+  applyThemeOnly(th: Theme) {
+    this.renderer.setClearColor(th.fog);
+    (this.scene.fog as THREE.Fog).color.setHex(th.fog);
+    this.hemi.color.setHex(th.hemiSky);
+    this.hemi.groundColor.setHex(th.hemiGround);
+    this.sun.color.setHex(th.lightColor);
+    this.sunDir.set(th.sunDir[0], th.sunDir[1], th.sunDir[2]).normalize();
+    this.sunBase.copy(this.sunDir);
+    this.rayCol.setHex(th.sunColor);
+    this.levelObjs.applyTheme(th);
+    this.sun.shadow.needsUpdate = true;
+  }
+
+  /**
+   * Changes the arena or theme in-game. If only the theme changed on the same map layout,
+   * updates the theme in place; if the map layout changed, rebuilds the arena, updates the theme,
+   * and respawns all players.
+   */
+  setMapOrTheme(levelId: LevelId, gen?: ServerInfo['gen']) {
+    const prevGen = this.server.gen;
+    const sameLayout =
+      this.server.level === levelId &&
+      (levelId !== 'procedural' ||
+        (prevGen?.seed === gen?.seed &&
+          prevGen?.size === gen?.size &&
+          prevGen?.w === gen?.w &&
+          prevGen?.d === gen?.d &&
+          prevGen?.style === gen?.style));
+    this.server = { ...this.server, level: levelId, gen };
+    const next = getLevel(levelId, gen);
+    this.level = next;
+    this.applyThemeOnly(next.theme);
+    if (sameLayout) {
+      this.map = renderLevelMap(next, 256);
+      this.emit({ type: 'announce', text: `THEME · ${next.themeName ?? 'UPDATED'}`, sub: next.name, tone: 'info' });
+      return;
+    }
+    this.scene.remove(this.levelObjs.group);
+    this.levelObjs.dispose();
+    this.levelObjs = buildLevelObjects(next, this.renderer.capabilities.getMaxAnisotropy());
+    this.scene.add(this.levelObjs.group);
+    this.world = new World(next.boxes);
+    this.nav = new Nav(this.world, next.w, next.d);
+    this.map = renderLevelMap(next, 256);
+    this.spawnNodes = [];
+    this.pickups.forEach((p) => this.scene.remove(p.group));
+    this.pickups = [];
+    this.setupPickups();
+    this.aiCtx.world = this.world;
+    this.aiCtx.nav = this.nav;
+    this.aiCtx.pickups = this.pickups;
+    this.sun.shadow.needsUpdate = true;
+    for (const f of this.fighters) {
+      if (!f.gone) this.spawnFighter(f, true);
+    }
+    this.emit({ type: 'announce', text: next.name.toUpperCase(), sub: 'Map changed · all pilots respawned', tone: 'info' });
   }
 
   resume() {
@@ -750,9 +848,9 @@ export class Engine {
 
   getScoreboard(): ScoreRow[] {
     if (!this.scoreDirty && this.scoreCache.length) return this.scoreCache;
-    const byPoints = this.mode === 'koth' || this.mode === 'bounty';
+    const byPoints = this.mode === 'koth' || this.mode === 'bounty' || this.mode === 'ctf';
     this.scoreCache = this.fighters
-      .filter((f) => !f.gone)
+      .filter((f) => !f.gone && (!this.coOp || f.team === 0))
       .map((f) => ({ id: f.id, name: f.name, team: f.team, kills: f.kills, deaths: f.deaths, score: f.score, ping: Math.round(f.ping), isPlayer: f.isPlayer, alive: f.alive }))
       .sort(byPoints ? (a, b) => b.score - a.score || b.kills - a.kills : (a, b) => b.kills - a.kills || a.deaths - b.deaths || b.score - a.score);
     this.scoreDirty = false;
@@ -822,15 +920,18 @@ export class Engine {
     this.fighters.length = 0;
     this.usedNames.clear();
     this.nextId = 1;
+    this.mode = this.rules.mode;
+    this.aiCtx.warmup = this.warmup;
     const s = this.settings;
-    const myTeam = Math.random() < 0.5 ? 0 : 1;
+    const myTeam = this.coOp ? 0 : Math.random() < 0.5 ? 0 : 1;
     this.usedNames.add(s.name);
-    const p = new Fighter(0, s.name || 'Player', this.teamplay ? myTeam : 0, true, this.teamplay ? TEAM_COLORS[myTeam] : 0xffffff, 'player');
-    p.ping = this.server.ping;
+    const p = new Fighter(0, s.name || 'Player', this.teamMode ? myTeam : 0, true, this.teamMode ? TEAM_COLORS[myTeam] : 0xffffff, 'player');
+    p.ping = this.server.hosted ? 5 : this.server.ping;
     this.player = p;
     this.fighters.push(p);
     const counts = [this.teamplay && myTeam === 0 ? 1 : 0, this.teamplay && myTeam === 1 ? 1 : 0];
     const nextTeam = () => {
+      if (this.coOp) return 0;
       let team = 0;
       if (this.teamplay) {
         team = counts[0] <= counts[1] ? 0 : 1;
@@ -838,24 +939,36 @@ export class Engine {
       }
       return team;
     };
-    // duels are strictly one-on-one
     const target = this.mode === 'duel' ? 1 : this.botTarget;
     for (const prof of this.fakeProfiles.slice(0, target)) this.fighters.push(this.makeFake(nextTeam(), prof.name, prof));
     let bi = 0;
-    while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
-    this.mode = this.rules.mode;
+    if (!this.warmup) {
+      if (this.coOp) {
+        const hordeCount = Math.max(6, Math.min(16, 4 + this.wave * 2));
+        for (let i = 0; i < hordeCount; i++) this.fighters.push(this.makeBot(1, bi++));
+      } else {
+        while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
+      }
+    }
     this.wave = 1;
     this.waveKills = 0;
     this.bountyId = -1;
-    this.bountyT = 0;
+    this.aiCtx.bountyId = -1;
     this.hillAcc = 0;
     this.scoreDirty = true;
     this.scoreCache = [];
+    if (this.hillMesh) {
+      this.scene.remove(this.hillMesh);
+      this.hillMesh = null;
+    }
+    if (this.bountyMarker) {
+      this.scene.remove(this.bountyMarker);
+      this.bountyMarker = null;
+    }
     this.flags.forEach((f) => this.scene.remove(f.mesh));
     this.flags = [];
-    this.setupSpecialMode();
+    if (!this.warmup) this.setupSpecialMode();
     this.aiCtx.fighters = this.fighters;
-    // spawn bots first so the player can be placed with action nearby
     for (const f of this.fighters) if (!f.isPlayer) this.spawnFighter(f, true);
     this.spawnFighter(p, true);
     // weapons
@@ -872,8 +985,27 @@ export class Engine {
     const pr = this.P;
     pr.crouchToggle = false;
     pr.dashCd = 0;
-    const modeName = this.rules.mode === 'survival' ? 'SURVIVAL' : this.rules.mode === 'koth' ? 'HOLD THE HILL' : this.rules.mode === 'ctf' ? 'CAPTURE THE FLAG' : this.rules.mode === 'bounty' ? 'BOUNTY HUNT' : this.teamplay ? `FIRST TEAM TO ${this.rules.scoreLimit}` : this.rules.scoreLimit > 0 ? `FIRST TO ${this.rules.scoreLimit} FRAGS` : 'ENDLESS DEATHMATCH';
-    this.emit({ type: 'announce', text: modeName, sub: this.server.name, tone: 'info' });
+    const modeName = this.warmup
+      ? 'PRE-MATCH WARMUP'
+      : this.rules.mode === 'survival'
+        ? 'CO-OP SURVIVAL'
+        : this.rules.mode === 'koth'
+          ? 'HOLD THE HILL'
+          : this.rules.mode === 'ctf'
+            ? 'CAPTURE THE FLAG'
+            : this.rules.mode === 'bounty'
+              ? 'BOUNTY HUNT'
+              : this.teamplay
+                ? `FIRST TEAM TO ${this.rules.scoreLimit}`
+                : this.rules.scoreLimit > 0
+                  ? `FIRST TO ${this.rules.scoreLimit} FRAGS`
+                  : 'ENDLESS DEATHMATCH';
+    this.emit({
+      type: 'announce',
+      text: modeName,
+      sub: this.warmup ? 'Damage & scoring disabled · roam the arena' : this.server.name,
+      tone: 'info',
+    });
     this.emit({ type: 'chat', name: 'SERVER', text: `Connected to ${this.server.name} — ${this.server.motd}`, team: -1, system: true });
     audio.play('go');
   }
@@ -887,9 +1019,9 @@ export class Engine {
 
   private makeBot(team: number, idx: number): Fighter {
     const name = genBotName(this.usedNames);
-    const color = this.teamplay ? TEAM_COLORS[team] : BOT_COLORS[idx % BOT_COLORS.length];
+    const color = this.coOp ? (team === 1 ? 0xff3b5c : TEAM_COLORS[0]) : this.teamplay ? TEAM_COLORS[team] : BOT_COLORS[idx % BOT_COLORS.length];
     const f = new Fighter(this.nextId++, name, team, false, color, 'bot');
-    f.ping = 8 + Math.random() * 22;
+    f.ping = 8 + Math.random() * 14;
     f.skill = this.skillFor(f);
     f.region = this.server.region;
     f.ai = newAI();
@@ -899,7 +1031,7 @@ export class Engine {
   }
 
   private makeFake(team: number, name: string, prof?: FakeProfile): Fighter {
-    const color = this.teamplay ? TEAM_COLORS[team] : BOT_COLORS[this.fighters.length % BOT_COLORS.length];
+    const color = this.teamMode ? TEAM_COLORS[team] : BOT_COLORS[this.fighters.length % BOT_COLORS.length];
     const f = new Fighter(this.nextId++, name, team, false, color, 'fake');
     this.usedNames.add(name);
     f.profileSkill = prof?.skill;
@@ -917,6 +1049,10 @@ export class Engine {
     if (!this.spawnNodes.length) this.spawnNodes = this.nav.spread(30, this.rand, 0, 99, 7);
     let best = this.nav.nodes[this.spawnNodes[0]];
     let bs = -1e9;
+    // With few live AI, bias respawns toward the player so the action never dries up
+    const wantNearPlayer = this.liveAIT < this.minActiveAI && !f.isPlayer;
+    const px = this.player.body.x;
+    const pz = this.player.body.z;
     for (const id of this.spawnNodes) {
       const n = this.nav.nodes[id];
       let minD = 90;
@@ -933,7 +1069,12 @@ export class Engine {
       }
       let sc: number;
       if (first && f.isPlayer) sc = -Math.abs(minD - 34) - seen * 20 + Math.random() * 6;
-      else sc = Math.min(minD, 60) - seen * 22 + Math.random() * 14;
+      else if (wantNearPlayer) {
+        const ddx = n.x - px, ddz = n.z - pz;
+        const pd = Math.sqrt(ddx * ddx + ddz * ddz);
+        // Ideal engagement range ~ 18m: penalize too close or too far
+        sc = -Math.abs(pd - 18) * 0.6 - seen * 10 + Math.random() * 4;
+      } else sc = Math.min(minD, 60) - seen * 22 + Math.random() * 14;
       if (sc > bs) {
         bs = sc;
         best = n;
@@ -950,7 +1091,7 @@ export class Engine {
     b.h = STAND_H;
     b.r = R;
     b.onGround = false;
-    f.hp = 100;
+    f.hp = f.isPlayer && this.cheats.oneHp ? 1 : 100;
     f.armor = 0;
     f.alive = true;
     f.spawnProt = f.isPlayer ? 2.2 : 1.6;
@@ -1025,6 +1166,12 @@ export class Engine {
 
   private step(dt: number) {
     this.frameN++;
+    // Mouse look deltas are accumulated during the frame; mark the camera dirty so the
+    // projection matrix is only rebuilt when the view actually changed.
+    if (this.mouseDirty) {
+      this.mouseDirty = false;
+      this.cameraDirty = true;
+    }
     if (this.state === 'playing') this.simulate(dt, dt);
     else if (this.state === 'over') this.simulate(dt * 0.3, dt);
     else if (this.state === 'intro') this.introStep(dt);
@@ -1060,26 +1207,40 @@ export class Engine {
     if (p.spawnProt > 0) p.spawnProt -= dt;
     if (playing) this.updateWeapon(rdt);
     this.rebuildFighterGrid();
-    // bots (LOD: near every frame, mid every 3rd, far every 8th)
+    // bots (LOD: near every frame, mid every 3rd, far every 8th). Stop AI immediately once the match ends.
     const cam = this.camera.position;
+    const hideNames = this.cheats.wallhack;
     for (const f of this.fighters) {
       if (f.isPlayer || f.gone) continue;
       if (f.alive) {
         if (f.spawnProt > 0) f.spawnProt -= dt;
-        const dx = f.body.x - cam.x, dz = f.body.z - cam.z;
-        const d2 = dx * dx + dz * dz;
-        const lod = d2 < 625 ? 0 : d2 < 3025 ? 1 : 2;
-        if (lod === 2 && (this.frameN + f.id) % 8 !== 0) {
-          // still apply gravity/physics cheaply between AI ticks
+        // Never let dead/respawning AI keep a stale target (prevents attacking a respawning player)
+        if (f.ai && f.ai.target && !f.ai.target.alive) {
+          f.ai.target = null;
+          f.ai.canSee = false;
+          f.ai.path = [];
+        }
+        if (!playing || this.over) {
+          f.body.vx *= 0.85;
+          f.body.vz *= 0.85;
           f.body.vy -= this.gravity * dt;
           this.world.moveBody(f.body, dt);
-        } else updateBot(this.aiCtx, f, dt, lod);
-        this.botFootsteps(f, dt);
+          f.moveSpeed = Math.hypot(f.body.vx, f.body.vz);
+        } else {
+          const dx = f.body.x - cam.x, dz = f.body.z - cam.z;
+          const d2 = dx * dx + dz * dz;
+          const lod = d2 < 625 ? 0 : d2 < 3025 ? 1 : 2;
+          if (lod === 2 && (this.frameN + f.id) % 8 !== 0) {
+            f.body.vy -= this.gravity * dt;
+            this.world.moveBody(f.body, dt);
+          } else updateBot(this.aiCtx, f, dt, lod);
+          this.botFootsteps(f, dt);
+        }
       } else {
         f.respawnT -= dt;
-        if (f.respawnT <= 0 && this.state === 'playing') this.spawnFighter(f);
+        if (f.respawnT <= 0 && playing && !this.over) this.spawnFighter(f);
       }
-      if (f.view) f.view.update(f, dt, this.time, cam.x, cam.y, cam.z, true);
+      if (f.view) f.view.update(f, dt, this.time, cam.x, cam.y, cam.z, !hideNames);
     }
     this.updateRockets(dt);
     this.updateLights(rdt);
@@ -1099,18 +1260,52 @@ export class Engine {
     this.updateViewmodel(rdt);
     this.updateVfx(rdt);
     if (playing) this.updateMatchEvents(dt);
-    // hud
+    // HUD at 10 Hz, but throttle further (to ~4 Hz) when nothing scoreboard-relevant changed
     this.hudT -= rdt;
     if (this.hudT <= 0) {
-      this.hudT = 0.1;
+      const fast = this.scoreDirty || p.alive !== this.lastHudAlive || this.cheats.aimbot;
+      this.hudT = fast ? 0.1 : 0.25;
+      this.lastHudAlive = p.alive;
       this.handlers.onHud(this.makeHud());
-      // ping: fake players depend on their region vs the server region; bots are unaffected
+      // ping: fake players depend on their region vs the server region; bots and host are unaffected
       for (const f of this.fighters) {
         if (f.isPlayer) continue;
-        if (f.kind === 'fake') f.ping = clamp(pingFor(this.server.region, f.region) + (Math.random() - 0.5) * 6, 5, 400);
-        else f.ping = clamp(f.ping + (Math.random() - 0.5) * 2, 4, 40);
+        if (f.kind === 'fake') {
+          const targetPing = pingFor(this.server.region, f.region);
+          f.ping = clamp(f.ping * 0.75 + targetPing * 0.25 + (Math.random() - 0.5) * 3, 5, 360);
+        } else {
+          f.ping = clamp(f.ping + (Math.random() - 0.5) * 1.5, 4, 24);
+        }
       }
-      p.ping = Math.max(5, this.server.ping + (Math.random() - 0.5) * 8);
+      p.ping = clamp(userPingTo(this.server.region, this.server.hosted ? 0 : 4) + (Math.random() - 0.5) * 3, 5, 340);
+    }
+
+    // Enforce a minimum number of live AI opponents so small lobbies never feel empty.
+    // Respawns are biased toward the player's vicinity (see pickSpawn) to avoid far-away unloads.
+    if (playing && !this.over && this.mode !== 'duel') {
+      let live = 0;
+      for (const f of this.fighters) {
+        if (f.isPlayer || f.gone) continue;
+        if (f.alive && this.aiCtx.isEnemy(this.player, f)) live++;
+      }
+      this.liveAIT = live;
+      let guard = 0;
+      while (live < this.minActiveAI && guard++ < this.minActiveAI) {
+        // Prefer respawning an existing dead enemy (cheapest), otherwise spawn a fresh bot
+        let dead = this.fighters.find((f) => !f.isPlayer && !f.gone && !f.alive && this.aiCtx.isEnemy(this.player, f));
+        if (!dead && this.fighters.length < 120) {
+          const team = this.teamMode ? (this.player.team === 0 ? 1 : 0) : 0;
+          dead = this.makeBot(team, this.fighters.length);
+          this.fighters.push(dead);
+          this.aiCtx.fighters = this.fighters;
+          this.scoreDirty = true;
+        }
+        if (dead) {
+          dead.respawnT = 0;
+          this.spawnFighter(dead);
+          live++;
+        } else break;
+      }
     }
   }
 
@@ -1179,7 +1374,6 @@ export class Engine {
       m.visible = false;
       this.scene.add(m);
       this.bountyMarker = m;
-      this.bountyT = 0.1;
     }
   }
 
@@ -1207,6 +1401,7 @@ export class Engine {
   }
 
   private updateSpecial(dt: number) {
+    if (this.warmup || this.over) return;
     if (this.mode === 'koth') {
       const occ = this.fighters.filter((f) => f.alive && this.inHill(f));
       this.hillAcc += dt;
@@ -1233,12 +1428,11 @@ export class Engine {
         if (top >= this.rules.scoreLimit) this.endMatch('limit');
       }
     } else if (this.mode === 'bounty') {
-      this.bountyT -= dt;
-      if (this.bountyT <= 0 || this.bountyId < 0 || !this.fighters.find((f) => f.id === this.bountyId && f.alive)) {
-        this.bountyT = 20;
-        const pool = this.fighters.filter((f) => !f.isPlayer && f.alive);
+      if (this.bountyId < 0 || !this.fighters.find((f) => f.id === this.bountyId && f.alive && !f.gone)) {
+        const pool = this.fighters.filter((f) => !f.isPlayer && f.alive && !f.gone);
         if (pool.length) {
           this.bountyId = pickOf(pool).id;
+          this.aiCtx.bountyId = this.bountyId;
           this.emit({ type: 'announce', text: 'BOUNTY MARKED', sub: this.fighters.find((f) => f.id === this.bountyId)?.name, tone: 'info' });
         }
       }
@@ -1261,15 +1455,16 @@ export class Engine {
             fl.z = fl.carrier.body.z;
             const ownBase = this.flags.find((o) => o.team === fl.carrier!.team)!;
             if (Math.hypot(fl.carrier.body.x - ownBase.baseX, fl.carrier.body.z - ownBase.baseZ) < 3) {
-              fl.carrier.carrying = -1;
+              const capturer = fl.carrier;
+              const capTeam = capturer.team;
+              capturer.carrying = -1;
               fl.carrier = null;
               fl.x = fl.baseX;
               fl.z = fl.baseZ;
-              this.teamScore[fl.team === 0 ? 1 : 0] += 1;
-              const scorer = this.fighters.find((f) => f.team === (fl.team === 0 ? 1 : 0) && f.alive);
-              if (scorer) scorer.score += 200;
+              this.teamScore[capTeam] += 1;
+              capturer.score += 1;
               this.scoreDirty = true;
-              this.emit({ type: 'announce', text: 'FLAG CAPTURED', sub: fl.team === 0 ? 'MAGENTA SCORES' : 'CYAN SCORES', tone: 'good' });
+              this.emit({ type: 'announce', text: 'FLAG CAPTURED', sub: `${capturer.name} · ${capTeam === 0 ? 'CYAN' : 'MAGENTA'} SCORES`, tone: 'good' });
               audio.play('streak');
               if (this.rules.scoreLimit > 0 && Math.max(this.teamScore[0], this.teamScore[1]) >= this.rules.scoreLimit) this.endMatch('limit');
             }
@@ -1309,7 +1504,7 @@ export class Engine {
 
   private updateMatchEvents(dt: number) {
     if (this.over) return;
-    if (this.rules.timeLimit > 0 && this.rules.timeLimit + this.extraTime - this.t <= 0) {
+    if (!this.warmup && this.rules.timeLimit > 0 && this.rules.timeLimit + this.extraTime - this.t <= 0) {
       this.endMatch('time');
       return;
     }
@@ -1355,7 +1550,12 @@ export class Engine {
   private say(f: Fighter, kind: ChatKind, vars: Record<string, string> = {}) {
     if (f.kind !== 'fake' || this.chatBudget > 0) return;
     this.chatBudget = 1.2;
-    this.emit({ type: 'chat', name: f.name, text: chatLine(kind, vars), team: this.teamplay ? f.team : -1 });
+    this.emit({
+      type: 'chat',
+      name: f.name,
+      text: chatLine(kind, { region: f.region, map: this.level.name, ...vars }),
+      team: this.teamMode ? f.team : -1,
+    });
   }
 
   private botFootsteps(f: Fighter, dt: number) {
@@ -1452,7 +1652,11 @@ export class Engine {
   setCheats(c: Cheats) {
     this.cheats = { ...c };
     if (Object.values(c).some(Boolean)) this.cheated = true;
-    this.emit({ type: 'chat', name: 'SERVER', text: `Host updated cheats: ${Object.entries(c).filter(([, v]) => v).map(([k]) => k).join(', ') || 'none'}`, team: -1, system: true });
+    if (c.oneHp && this.player.alive) {
+      this.player.hp = 1;
+      this.player.armor = 0;
+    }
+    this.emit({ type: 'chat', name: 'SERVER', text: `sv_cheats: ${Object.entries(c).filter(([, v]) => v).map(([k]) => k).join(', ') || 'off'}`, team: -1, system: true });
   }
   setDifficulty(d: Difficulty) {
     this.rules = { ...this.rules, difficulty: d };
@@ -1463,7 +1667,8 @@ export class Engine {
   addBot() {
     if (this.fighters.length >= 120) return;
     let team = 0;
-    if (this.teamplay) {
+    if (this.coOp) team = 1;
+    else if (this.teamplay) {
       const c0 = this.fighters.filter((f) => f.team === 0).length;
       team = c0 <= this.fighters.length - c0 ? 0 : 1;
     }
@@ -1496,20 +1701,48 @@ export class Engine {
     this.endMatch('time');
   }
 
-  /** Screen-space boxes for enemies (wallhack cheat) */
+  /** Screen-space boxes for enemies (wallhack cheat), with throttled shootability (LOS) detection. */
   getEsp(w: number, h: number) {
-    const out: { x: number; y: number; h: number; name: string; d: number; hp: number }[] = [];
+    const out: { x: number; y: number; h: number; name: string; d: number; hp: number; shootable: boolean }[] = [];
     if (!this.cheats.wallhack || this.state === 'intro') return out;
+    // Throttle the expensive full ESP loop to ~20 Hz; reuse the last cached projection between updates
+    this.espT += 1 / 60;
+    if (this.espT < 0.05) return this.espCache;
+    this.espT = 0;
+    this.espCache = out;
     const cam = this.camera;
+    const cx = cam.position.x, cy = cam.position.y, cz = cam.position.z;
     const p = this.player;
     for (const f of this.fighters) {
-      if (f.isPlayer || !f.alive || (this.teamplay && f.team === p.team)) continue;
+      if (f.isPlayer || !f.alive || (this.teamMode && f.team === p.team)) continue;
       const b = f.body;
       this.tmpV.set(b.x, b.y, b.z).project(cam);
       if (this.tmpV.z > 1 || this.tmpV.z < -1) continue;
       this.tmpV2.set(b.x, b.y + 1.95, b.z).project(cam);
       const y0 = (1 - this.tmpV.y) * 0.5 * h, y1 = (1 - this.tmpV2.y) * 0.5 * h;
-      out.push({ x: (this.tmpV.x * 0.5 + 0.5) * w, y: y1, h: y0 - y1, name: f.name, d: Math.hypot(b.x - p.body.x, b.z - p.body.z), hp: f.hp });
+      // Throttled LOS check (~20 Hz staggered per fighter) using the fast uniform grid raycast
+      if (this.time >= f.espVisT) {
+        f.espVisT = this.time + 0.045 + (f.id % 5) * 0.005;
+        const dx = b.x - cx, dz = b.z - cz;
+        const dyChest = b.y + (b.h > 1.5 ? 1.15 : 0.75) - cy;
+        const dChest = Math.sqrt(dx * dx + dyChest * dyChest + dz * dz) || 1;
+        let vis = this.world.raycast(cx, cy, cz, dx / dChest, dyChest / dChest, dz / dChest, dChest - 0.3) === Infinity;
+        if (!vis) {
+          const dyHead = b.y + (b.h > 1.5 ? 1.52 : 0.98) - cy;
+          const dHead = Math.sqrt(dx * dx + dyHead * dyHead + dz * dz) || 1;
+          vis = this.world.raycast(cx, cy, cz, dx / dHead, dyHead / dHead, dz / dHead, dHead - 0.3) === Infinity;
+        }
+        f.espVisible = vis;
+      }
+      out.push({
+        x: (this.tmpV.x * 0.5 + 0.5) * w,
+        y: y1,
+        h: y0 - y1,
+        name: f.name,
+        d: Math.hypot(b.x - p.body.x, b.z - p.body.z),
+        hp: f.hp,
+        shootable: f.espVisible,
+      });
     }
     return out;
   }
@@ -1535,7 +1768,7 @@ export class Engine {
     const near = this.nearbyFighters(cam.x, cam.z, 72);
     for (let ni = 0; ni < near.length; ni++) {
       const f = near[ni];
-      if (f.isPlayer || !f.alive || f.gone || (this.teamplay && f.team === p.team)) continue;
+      if (f.isPlayer || !f.alive || f.gone || (this.teamMode && f.team === p.team)) continue;
       const tx = f.body.x, ty = f.body.y + (f.body.h > 1.5 ? 1.15 : 0.75), tz = f.body.z;
       const dx = tx - cam.x, dy = ty - cam.y, dz = tz - cam.z;
       const dh = Math.hypot(dx, dz);
@@ -1552,6 +1785,88 @@ export class Engine {
     }
     this.aimResult = best;
     return best;
+  }
+
+  /**
+   * Aimbot cheat: snaps directly (no smoothing) to any shootable target (even off-screen)
+   * when firing, using the AI's internal state (wantX, wantZ, velocity, gravity) to predict
+   * where the target will move by the time the shot lands.
+   */
+  private applyAimbot(dt: number) {
+    const p = this.player;
+    const def = this.curDef();
+    const cam = this.camera.position;
+    const ox = cam.x, oy = cam.y, oz = cam.z;
+    let bestAng = 1e9;
+    let bestYaw = p.yaw;
+    let bestPitch = p.pitch;
+    let found = false;
+
+    for (const f of this.fighters) {
+      if (f.isPlayer || !f.alive || f.gone || f.spawnProt > 0 || (this.teamMode && f.team === p.team)) continue;
+      const b = f.body;
+      const d0 = Math.hypot(b.x - ox, b.y + 1.2 - oy, b.z - oz);
+      if (d0 > def.range || d0 < 0.25) continue;
+
+      // Predict target position when the shot lands using AI's internal desired velocity state
+      const tLead = clamp(def.speed > 0 ? d0 / def.speed : dt, 0, 1.1);
+      let px = b.x, py = b.y, pz = b.z;
+      if (tLead > 0.001) {
+        let vx = b.vx, vy = b.vy, vz = b.vz;
+        const wx = f.ai ? f.ai.wantX : vx;
+        const wz = f.ai ? f.ai.wantZ : vz;
+        const steps = Math.max(1, Math.min(8, Math.ceil(tLead / 0.035)));
+        const h = tLead / steps;
+        for (let s = 0; s < steps; s++) {
+          const k = Math.min(1, (py <= b.y + 0.02 && b.onGround ? 14 : 2.5) * h);
+          vx += (wx - vx) * k;
+          vz += (wz - vz) * k;
+          if (!b.onGround || py > 0.01) vy -= this.gravity * h;
+          px += vx * h;
+          pz += vz * h;
+          py = Math.max(0, py + vy * h);
+        }
+        // Keep predicted position outside world walls
+        if (this.world.anyOverlap(px - b.r, py + 0.05, pz - b.r, px + b.r, py + b.h, pz + b.r)) {
+          px = b.x;
+          py = b.y;
+          pz = b.z;
+        }
+      }
+
+      const headH = b.h > 1.5 ? 1.52 : 0.98;
+      const chestH = b.h > 1.5 ? 1.12 : 0.75;
+      const pts: [number, number, number][] =
+        def.id === 'rocket'
+          ? [[px, py + 0.85, pz], [b.x, b.y + 0.85, b.z]]
+          : def.headMul > 1
+            ? [[px, py + headH, pz], [px, py + chestH, pz], [b.x, b.y + headH, b.z], [b.x, b.y + chestH, b.z]]
+            : [[px, py + chestH, pz], [b.x, b.y + chestH, b.z]];
+
+      for (const [tx, ty, tz] of pts) {
+        const dx = tx - ox, dy = ty - oy, dz = tz - oz;
+        const dh = Math.hypot(dx, dz);
+        const dist = Math.hypot(dh, dy) || 1;
+        if (this.world.raycast(ox, oy, oz, dx / dist, dy / dist, dz / dist, dist - 0.28) !== Infinity) continue;
+        const yaw = Math.atan2(-dx, -dz);
+        const pitch = Math.atan2(dy, dh);
+        const ang = Math.hypot(angDiff(p.yaw, yaw), pitch - p.pitch);
+        if (ang < bestAng) {
+          bestAng = ang;
+          bestYaw = yaw;
+          bestPitch = pitch;
+          found = true;
+        }
+        break;
+      }
+    }
+
+    if (found) {
+      p.yaw = bestYaw;
+      p.pitch = clamp(bestPitch, -1.5, 1.5);
+      this.P.recoil = 0;
+      this.P.recoilYaw = 0;
+    }
   }
 
   /* ============================================================ player logic */
@@ -1613,8 +1928,15 @@ export class Engine {
       p.yaw += angDiff(p.yaw, fresh.yaw) * k2;
       p.pitch += (fresh.pitch - p.pitch) * k2 * 0.8;
     }
+    if (this.cheats.aimbot && (inp.fireHeld || inp.firePressed)) {
+      this.applyAimbot(dt);
+    }
     if (p.yaw > Math.PI) p.yaw -= TAU;
     if (p.yaw < -Math.PI) p.yaw += TAU;
+    if (this.cheats.oneHp) {
+      p.hp = 1;
+      p.armor = 0;
+    }
 
     // ---------- intent
     const hv0 = Math.hypot(b.vx, b.vz);
@@ -1979,6 +2301,10 @@ export class Engine {
     const p = this.player;
     const cam = this.camera;
     const C = this.cheats;
+    if (C.aimbot) {
+      this.applyAimbot(1 / 60);
+      cam.rotation.set(p.pitch, p.yaw, cam.rotation.z, 'YXZ');
+    }
     if (!this.insta && !C.infiniteAmmo) W.ammo[W.cur]--;
     W.fireCd = def.interval * (C.rapidFire ? 0.33 : 1);
     W.bloom = Math.min(W.bloom + def.bloom, 0.035);
@@ -2064,7 +2390,7 @@ export class Engine {
     for (let ni = 0; ni < near.length; ni++) {
       const f = near[ni];
       if (f === shooter || !f.alive || f.gone) continue;
-      if (this.teamplay && f.team === shooter.team) continue;
+      if (this.teamMode && f.team === shooter.team) continue;
       const b = f.body;
       const tb = rayAABB(ox, oy, oz, dx, dy, dz, b.x - 0.32, b.y, b.z - 0.32, b.x + 0.32, b.y + b.h, b.z + 0.32);
       if (tb < 0 || tb > limit) continue;
@@ -2160,7 +2486,7 @@ export class Engine {
       if (!boom && r.age > 0.05) {
         for (const f of this.fighters) {
           if (!f.alive || f.gone || (f === r.owner && r.age < 0.25)) continue;
-          if (this.teamplay && f.team === r.owner.team && f !== r.owner) continue;
+          if (this.teamMode && f.team === r.owner.team && f !== r.owner) continue;
           const b = f.body;
           if (ey > b.y - 0.1 && ey < b.y + b.h + 0.1 && Math.hypot(ex - b.x, ez - b.z) < 0.7) {
             boom = true;
@@ -2204,7 +2530,7 @@ export class Engine {
       const cx = b.x, cy = b.y + 0.9, cz = b.z;
       const d = Math.hypot(cx - x, cy - y, cz - z);
       if (d > radius) continue;
-      if (this.teamplay && f !== owner && f.team === owner.team) continue;
+      if (this.teamMode && f !== owner && f.team === owner.team) continue;
       if (small && f === owner) continue;
       const fall = 1 - d / radius;
       const self = f === owner;
@@ -2269,9 +2595,13 @@ export class Engine {
 
   /* ================================================================== damage */
   private damage(t: Fighter, amount: number, src: Fighter | null, head: boolean, wid: WeaponId, px: number, py: number, pz: number, dx: number, dy: number, dz: number): boolean {
-    if (!t.alive || t.gone || t.spawnProt > 0 || this.over) return false;
-    if (src && src !== t && this.teamplay && src.team === t.team) return false;
-    if (t.isPlayer && this.cheats.god) {
+    if (this.warmup || !t.alive || t.gone || t.spawnProt > 0 || this.over) return false;
+    if (src && src !== t && this.teamMode && src.team === t.team) return false;
+    if (t.isPlayer && (this.cheats.god || this.cheats.oneHp)) {
+      if (this.cheats.oneHp) {
+        t.hp = 1;
+        t.armor = 0;
+      }
       this.vfx.damage = Math.min(0.3, this.vfx.damage + 0.1);
       return false;
     }
@@ -2344,29 +2674,48 @@ export class Engine {
       if (this.t - src.multiT < 3.4) src.multiN++;
       else src.multiN = 1;
       src.multiT = this.t;
-      points = 100 + (head ? 50 : 0) + Math.min(100, (src.streak - 1) * 10) + (src.multiN - 1) * 50;
-      if (this.mode === 'bounty' && t.id === this.bountyId) {
-        points += 75;
-        this.bountyId = -1;
-        this.bountyT = 0.1;
-        this.emit({ type: 'announce', text: 'BOUNTY CLAIMED', sub: `+75 · ${t.name}`, tone: 'streak' });
+
+      if (this.mode === 'ctf' || this.mode === 'koth') {
+        // In CTF and KOTH, score only increases via objective play (flag captures / holding the hill)
+        points = 0;
+      } else if (this.mode === 'bounty') {
+        // In Bounty, hunting down the marked target is the only way to score points
+        if (t.id === this.bountyId) {
+          points = 1;
+          src.score += 1;
+          this.bountyId = -1;
+          this.aiCtx.bountyId = -1;
+          this.emit({ type: 'announce', text: 'BOUNTY CLAIMED', sub: `+1 BOUNTY · ${t.name}`, tone: 'streak' });
+        } else {
+          points = 0;
+        }
+      } else {
+        points = 100 + (head ? 50 : 0) + Math.min(100, (src.streak - 1) * 10) + (src.multiN - 1) * 50;
+        src.score += points;
+        if (this.mode === 'tdm') this.teamScore[src.team]++;
       }
-      src.score += points;
-      if (this.teamplay) this.teamScore[src.team]++;
-      if (this.mode === 'survival' && src.isPlayer) {
+
+      if (this.mode === 'survival' && src.team === 0 && t.team === 1) {
         this.waveKills++;
-        if (this.waveKills >= 5) {
+        const need = 5 + (this.wave - 1) * 2;
+        if (this.waveKills >= need) {
           this.waveKills = 0;
           this.wave++;
-          src.hp = Math.min(100, src.hp + 35);
-          this.emit({ type: 'announce', text: `WAVE ${this.wave}`, sub: '+35 HP · they get tougher', tone: 'streak' });
+          for (const surv of this.fighters) {
+            if (surv.team === 0 && !surv.gone) {
+              if (surv.alive && !(surv.isPlayer && this.cheats.oneHp)) surv.hp = Math.min(100, surv.hp + 35);
+              else if (!surv.alive && !surv.isPlayer) this.spawnFighter(surv);
+            }
+          }
+          if (this.fighters.filter((x) => x.team === 1).length < 18) {
+            const extra = this.makeBot(1, this.fighters.length);
+            this.fighters.push(extra);
+            this.spawnFighter(extra);
+          }
+          this.emit({ type: 'announce', text: `WAVE ${this.wave}`, sub: '+35 HP · hostile reinforcements incoming', tone: 'streak' });
           audio.play('streak');
         }
       }
-    } else {
-      t.kills = Math.max(0, t.kills - 1);
-      t.score = Math.max(0, t.score - 50);
-      if (this.teamplay) this.teamScore[t.team] = Math.max(0, this.teamScore[t.team] - 1);
     }
     // gibs
     const col = t.isPlayer ? 0xff3b5c : t.color;
@@ -2422,7 +2771,7 @@ export class Engine {
   }
 
   private checkWin() {
-    if (this.over) return;
+    if (this.over || this.warmup) return;
     const lim = this.rules.scoreLimit;
     if (this.mode === 'survival') {
       // survival is decided by waves reached (or by dying, see kill())
@@ -2430,9 +2779,9 @@ export class Engine {
       return;
     }
     if (lim <= 0) return;
-    if (this.teamplay) {
+    if (this.mode === 'tdm' || this.mode === 'ctf') {
       if (this.teamScore[0] >= lim || this.teamScore[1] >= lim) this.endMatch('limit');
-    } else if (this.mode === 'koth' || this.mode === 'ctf') {
+    } else if (this.mode === 'koth' || this.mode === 'bounty') {
       const top = Math.max(...this.fighters.map((f) => f.score));
       if (top >= lim) this.endMatch('limit');
     } else {
@@ -2467,7 +2816,8 @@ export class Engine {
       winnerName = `WAVE ${this.wave}`;
     }
     this.over = { winner: winnerName, reason };
-    const score = p.score + (won ? 500 : 0);
+    const isObjMode = this.mode === 'ctf' || this.mode === 'koth' || this.mode === 'bounty';
+    const score = isObjMode ? p.score : p.score + (won ? 500 : 0);
     const res: MatchResult = {
       id: this.matchId, won, rank, total: rows.length, score, kills: p.kills, deaths: p.deaths, headshots: p.headshots,
       accuracy: p.shotsFired ? p.shotsHit / p.shotsFired : 0, bestStreak: p.bestStreak, duration: this.t, rows, winnerName,
@@ -2502,8 +2852,9 @@ export class Engine {
         if (Math.abs(b.x - pk.x) > 1.2 || Math.abs(b.z - pk.z) > 1.2 || b.y - pk.y > 1.2 || b.y - pk.y < -1.8) continue;
         if (pk.type === 'health' && f.hp >= 100) continue;
         if (pk.type === 'armor' && f.armor >= 100) continue;
-        if (pk.type === 'health') f.hp = Math.min(100, f.hp + 50);
-        else f.armor = Math.min(100, f.armor + 60);
+      if (f.isPlayer && this.cheats.oneHp) continue;
+      if (pk.type === 'health') f.hp = Math.min(100, f.hp + 50);
+      else f.armor = Math.min(100, f.armor + 60);
         pk.active = false;
         pk.t = 18;
         pk.group.visible = false;
@@ -2583,14 +2934,16 @@ export class Engine {
     }
     cam.position.set(px, b.y + P.eye + bobY - P.landDip + P.stepOff, pz);
     cam.rotation.set(p.pitch + P.recoil + P.kick * 0.012 + shP, p.yaw + P.recoilYaw + shY, roll + shR, 'YXZ');
-    // fov
+    this.cameraDirty = true;
+    // fov: only update the projection matrix when the value actually changed beyond a threshold
     const base = s.fov;
     let fov = base * lerp(1, 0.66, P.aimT) + P.sprintT * 5 + P.slideW * 7 + P.fovPunch + Math.max(0, Math.min(6, (P.hv - 11) * 0.5));
     if (P.dashT > 0) fov += 6;
     P.fovCur = lerp(P.fovCur, fov, Math.min(1, dt * 12));
-    if (Math.abs(cam.fov - P.fovCur) > 0.01) {
+    if (Math.abs(cam.fov - P.fovCur) > 0.05 || this.cameraDirty) {
       cam.fov = P.fovCur;
       cam.updateProjectionMatrix();
+      this.cameraDirty = false;
     }
     this.vfx.fov = (cam.fov * Math.PI) / 180;
     // sun follows
@@ -2728,7 +3081,8 @@ export class Engine {
       cur: W.cur,
       dash: clamp(1 - this.P.dashCd / (this.rules.mutator === 'turbo' ? 1.2 : 1.7), 0, 1),
       speed: hv,
-      timeLeft: this.rules.timeLimit > 0 ? Math.max(0, this.rules.timeLimit + this.extraTime - this.t) : 0,
+      // During warmup the match clock is frozen (timer disabled until the match actually starts)
+      timeLeft: this.warmup ? (this.rules.timeLimit > 0 ? this.rules.timeLimit + this.extraTime : 0) : this.rules.timeLimit > 0 ? Math.max(0, this.rules.timeLimit + this.extraTime - this.t) : 0,
       scoreLimit: this.rules.scoreLimit,
       mode: this.rules.mode,
       myKills: p.kills,
@@ -2763,6 +3117,7 @@ export class Engine {
       leaderScore: lead ? lead.score : 0,
       bountyRel,
       bountyDist,
+      warmup: this.warmup,
     };
     return h;
   }
@@ -2801,7 +3156,7 @@ export class Engine {
     for (const f of this.fighters) {
       if (f.isPlayer || !f.alive || f.gone) continue;
       const dx = f.body.x - p.body.x, dz = f.body.z - p.body.z;
-      const friendly = this.teamplay && f.team === p.team;
+      const friendly = this.teamMode && f.team === p.team;
       const d = Math.hypot(dx, dz);
       const spotted = friendly || this.t - f.lastShotT < 1.8 || d < 14;
       if (!spotted) continue;

@@ -36,6 +36,7 @@ export interface LevelData {
   id: LevelId;
   key?: string;
   themeName?: string;
+  styleName?: string;
   name: string;
   tagline: string;
   size: string;
@@ -238,7 +239,7 @@ function plaza(): LevelData {
     placed++;
   }
   return {
-    id: 'plaza', name: 'Neon Plaza', tagline: 'Open ziggurat arena with fast sightlines and jump pads.', size: '120 × 120',
+    id: 'plaza', themeName: 'Neon', styleName: 'Mixed', name: 'Neon Plaza', tagline: 'Open ziggurat arena with fast sightlines and jump pads.', size: '120 × 120',
     w: 120, d: 120, maxH: 14, boxes: L.boxes, glow: L.glow, pads: L.pads,
     theme: { skyTop: 0x12072e, skyBottom: 0xff5fa2, fog: 0x35134f, ground: 0x2a2350, accent: MG, accent2: CY, sunColor: 0xff8fc0, sunDir: [-0.5, 0.55, -0.65], hemiSky: 0xb7a0ff, hemiGround: 0x3a1f5c, lightColor: 0xffd2e8, discColor: 0xff5fa2 },
   };
@@ -314,7 +315,7 @@ function yard(): LevelData {
     void p;
   }
   return {
-    id: 'yard', name: 'Container Yard', tagline: 'Maze of stacked containers, catwalks and a central crane tower.', size: '150 × 100',
+    id: 'yard', themeName: 'Dusk', styleName: 'Maze', name: 'Container Yard', tagline: 'Maze of stacked containers, catwalks and a central crane tower.', size: '150 × 100',
     w: 150, d: 100, maxH: 12, boxes: L.boxes, glow: L.glow, pads: L.pads,
     theme: { skyTop: 0x1b1030, skyBottom: 0xff9a3c, fog: 0x3f2338, ground: 0x3a3745, accent: OR, accent2: CY, sunColor: 0xffb070, sunDir: [0.6, 0.45, -0.6], hemiSky: 0xffc9a0, hemiGround: 0x3d2a4a, lightColor: 0xffd8b0, discColor: 0xffa040 },
   };
@@ -399,7 +400,7 @@ function skyline(): LevelData {
     placed++;
   }
   return {
-    id: 'skyline', name: 'Skyline District', tagline: 'Vertical city blocks. Fight in the streets or launch onto rooftops.', size: '124 × 124',
+    id: 'skyline', themeName: 'Midnight', styleName: 'Towers', name: 'Skyline District', tagline: 'Vertical city blocks. Fight in the streets or launch onto rooftops.', size: '124 × 124',
     w: 124, d: 124, maxH: 20, boxes: L.boxes, glow: L.glow, pads: L.pads,
     theme: { skyTop: 0x04071f, skyBottom: 0x7a3cff, fog: 0x160c3a, ground: 0x1b1b3a, accent: CY, accent2: MG, sunColor: 0xb89cff, sunDir: [-0.4, 0.5, 0.7], hemiSky: 0x9ab0ff, hemiGround: 0x2a1850, lightColor: 0xc9c0ff, discColor: 0xb06bff },
   };
@@ -460,7 +461,7 @@ function colosseum(): LevelData {
     placed++;
   }
   return {
-    id: 'colosseum', name: 'The Colosseum', tagline: 'A sunken terraced bowl. Hold the high ground or own the pit.', size: '116 × 116',
+    id: 'colosseum', themeName: 'Ember', styleName: 'Open', name: 'The Colosseum', tagline: 'A sunken terraced bowl. Hold the high ground or own the pit.', size: '116 × 116',
     w: 116, d: 116, maxH: 16, boxes: L.boxes, glow: L.glow, pads: L.pads,
     theme: { skyTop: 0x2b0f2e, skyBottom: 0xffc34d, fog: 0x4a2340, ground: 0x4b3a4a, accent: YL, accent2: MG, sunColor: 0xffcf80, sunDir: [0.3, 0.5, -0.8], hemiSky: 0xffd9a0, hemiGround: 0x4a2848, lightColor: 0xffe0b0, discColor: 0xffc34d },
   };
@@ -488,8 +489,11 @@ export function generateProcedural(seed: number, size: MapSize, opts?: { w?: num
   const W = Math.round(Math.max(60, Math.min(240, opts?.w ?? base)));
   const L = new LB(W, D, (Math.imul(seed, 2654435761) ^ 0x9e3779b9) >>> 0);
   for (let k = 0; k < 4; k++) L.r();
-  const T = (opts?.theme && opts.theme !== 'auto' ? PROC_THEMES.find((t) => t.id === opts.theme) : null) ?? PROC_THEMES[Math.floor(L.r() * PROC_THEMES.length)];
-  const style = opts?.style && opts.style !== 'auto' ? opts.style : T.style;
+  // Always draw both autoTheme and autoStyle so switching theme never alters style or layout RNG, and vice versa
+  const autoTheme = PROC_THEMES[Math.floor(L.r() * PROC_THEMES.length)];
+  const autoStyle = (['mixed', 'towers', 'maze', 'open'] as const)[Math.floor(L.r() * 4)];
+  const T = (opts?.theme && opts.theme !== 'auto' ? PROC_THEMES.find((t) => t.id === opts.theme) : null) ?? autoTheme;
+  const style = (opts?.style && opts.style !== 'auto' ? opts.style : autoStyle) as 'mixed' | 'towers' | 'maze' | 'open';
   const neon = [T.theme.accent, T.theme.accent2, YL];
   L.walls(T.wall, 14, T.theme.accent);
   // centrepiece
@@ -585,11 +589,75 @@ export function generateProcedural(seed: number, size: MapSize, opts?: { w?: num
     placed++;
   }
   const sz = SIZE_INFO[size];
+  const styleNice = style.charAt(0).toUpperCase() + style.slice(1);
   return {
-    id: 'procedural', themeName: T.name, key: `proc-${seed}-${size}-${W}x${D}-${T.id}-${style}`, name: `${T.name} Sector #${seed % 10000}`,
-    tagline: `Procedurally generated ${sz.name.toLowerCase()} arena (seed ${seed}).`, size: `${W} × ${D}`,
+    id: 'procedural', themeName: T.name, styleName: styleNice, key: `proc-${seed}-${size}-${W}x${D}-${T.id}-${style}`, name: `${T.name} Sector #${seed % 10000}`,
+    tagline: `Procedurally generated ${sz.name.toLowerCase()} arena · ${styleNice.toLowerCase()} layout (seed ${seed}).`, size: `${W} × ${D}`,
     w: W, d: D, maxH: 14, boxes: L.boxes, glow: L.glow, pads: L.pads, theme: T.theme,
   };
+}
+
+export interface BoxMetrics {
+  baseY: number;
+  objectHeight: number;
+  topY: number;
+  clearanceUnder: number;
+  width: number;
+  depth: number;
+  area: number;
+  volume: number;
+  cx: number;
+  cz: number;
+  kind: string;
+  traversal: string;
+}
+
+/**
+ * Calculates in-world elevation and object height for a structure box, taking into account
+ * underlying terraces/platforms when a box is anchored at y0=0 inside a raised tier.
+ */
+export function computeBoxMetrics(level: LevelData, box: Box): BoxMetrics {
+  const width = +(box.x1 - box.x0).toFixed(2);
+  const depth = +(box.z1 - box.z0).toFixed(2);
+  const cx = +((box.x0 + box.x1) / 2).toFixed(2);
+  const cz = +((box.z0 + box.z1) / 2).toFixed(2);
+  let supportBelow = 0;
+  for (const other of level.boxes) {
+    if (other === box) continue;
+    if (other.y1 >= box.y1 - 0.01) continue;
+    const ox = Math.min(box.x1, other.x1) - Math.max(box.x0, other.x0);
+    const oz = Math.min(box.z1, other.z1) - Math.max(box.z0, other.z0);
+    if (ox > 0.08 && oz > 0.08) {
+      // If box is elevated (y0 > 0), only count supports at or below box.y0
+      if (box.y0 > 0.01 && other.y1 > box.y0 + 0.05) continue;
+      if (other.y1 > supportBelow) supportBelow = other.y1;
+    }
+  }
+  const baseY = +(box.y0 > 0.01 ? box.y0 : supportBelow).toFixed(2);
+  const topY = +box.y1.toFixed(2);
+  const objectHeight = +Math.max(0.05, topY - baseY).toFixed(2);
+  const clearanceUnder = +(box.y0 > supportBelow + 0.05 ? box.y0 - supportBelow : 0).toFixed(2);
+  const area = +(width * depth).toFixed(1);
+  const volume = +(area * objectHeight).toFixed(1);
+
+  const hw = level.w / 2;
+  const hd = level.d / 2;
+  const isPerimeter = box.x0 <= -hw + 0.1 || box.x1 >= hw - 0.1 || box.z0 <= -hd + 0.1 || box.z1 >= hd - 0.1;
+  let kind = 'Structure';
+  if (isPerimeter && topY >= 10) kind = 'Perimeter Wall';
+  else if (clearanceUnder > 0.5 && objectHeight <= 1.6) kind = 'Bridge / Catwalk';
+  else if (objectHeight <= 0.6 && (width <= 6.5 || depth <= 6.5)) kind = 'Stair / Step';
+  else if (topY >= 7.5) kind = 'Tower / High-Rise';
+  else if (area >= 90) kind = 'Platform / Terrace';
+  else if (objectHeight <= 1.8) kind = 'Low Cover';
+  else kind = 'Fortification / Building';
+
+  let traversal = 'Requires stairs or jump pad';
+  if (objectHeight <= 0.56) traversal = 'Walkable step-up (≤ 0.56 m)';
+  else if (objectHeight <= 1.45) traversal = 'Single jump reachable';
+  else if (objectHeight <= 2.9) traversal = 'Double / wall-jump reachable';
+
+  return { baseY, objectHeight, topY, clearanceUnder, width, depth, area, volume, cx, cz, kind, traversal };
 }
 
 const builders: Record<BuiltinLevelId, () => LevelData> = { plaza, yard, skyline, colosseum };

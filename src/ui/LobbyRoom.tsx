@@ -51,10 +51,10 @@ export function lobbyOpponents(l: HostedLobby): number {
 
 export function newLobby(config: LobbyConfig, me: string): HostedLobby {
   const ip = config.isPublic ? `${pickOf(['51.38', '104.238', '185.62', '45.79'])}.${2 + Math.floor(Math.random() * 248)}.${2 + Math.floor(Math.random() * 248)}` : '192.168.1.' + (10 + Math.floor(Math.random() * 200));
-  return { config, ip, port: 27015, members: [{ name: me || 'Player', ping: 6, ready: true, host: true }], resolved: pickOf(LEVEL_IDS) };
+  return { config, ip, port: 27015, members: [{ name: me || 'Player', ping: 5, ready: true, host: true, region: config.region }], resolved: pickOf(LEVEL_IDS) };
 }
 
-export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby: HostedLobby; setLobby: (f: (l: HostedLobby) => HostedLobby) => void; onStart: () => void; onEdit: () => void; onClose: () => void }) {
+export function LobbyRoom({ lobby, setLobby, onStart, onWarmup, onEdit, onClose }: { lobby: HostedLobby; setLobby: (f: (l: HostedLobby) => HostedLobby) => void; onStart: () => void; onWarmup: () => void; onEdit: () => void; onClose: () => void }) {
   const c = lobby.config;
   const [chat, setChat] = useState<{ id: number; name: string; text: string; sys?: boolean }[]>([{ id: 0, name: '', text: `Lobby created on ${lobby.ip}:${lobby.port}${c.isPublic ? ' · listed publicly' : ' · private (LAN)'}`, sys: true }]);
   const [msg, setMsg] = useState('');
@@ -63,7 +63,10 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
   const uid = useRef(1);
   const chatEnd = useRef<HTMLDivElement>(null);
   const server = lobbyToServer(lobby);
-  const level = useMemo(() => getLevel(server.level, server.gen), [server.level, server.gen?.seed, server.gen?.size]); // eslint-disable-line react-hooks/exhaustive-deps
+  const level = useMemo(
+    () => getLevel(server.level, server.gen),
+    [server.level, server.gen?.seed, server.gen?.size, server.gen?.w, server.gen?.d, server.gen?.theme, server.gen?.style],
+  );
   const say = (name: string, text: string, sys?: boolean) => setChat((l) => [...l.slice(-40), { id: uid.current++, name, text, sys }]);
   const target = Math.min(c.fill, c.maxPlayers);
 
@@ -81,11 +84,12 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
       let after: (() => void) | null = null;
       if (!c.password && m.length < target && r < 0.55) {
         const name = genPlayerName(new Set(m.map((x) => x.name)));
-        next = { ...l, members: [...m, { name, ping: 12 + Math.floor(Math.random() * 140), ready: false, region: c.region }] };
+        const pr = Math.random() < 0.72 ? c.region : pickOf(['EU', 'NA', 'AS', 'SA', 'OC']);
+        next = { ...l, members: [...m, { name, ping: pingFor(c.region, pr), ready: false, region: pr }] };
         after = () => {
           say('', `${name} joined the lobby`, true);
           audio.play('join');
-          if (Math.random() < 0.4) setTimeout(() => say(name, chatLine('join', { region: c.region })), 700);
+          if (Math.random() < 0.4) setTimeout(() => say(name, chatLine('join', { region: pr })), 700);
         };
       } else if (m.some((x) => !x.host && !x.ready) && r < 0.85) {
         const who = pickOf(m.filter((x) => !x.host && !x.ready));
@@ -94,11 +98,19 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
         const who = pickOf(m.filter((x) => !x.host && !x.bot));
         next = { ...l, members: m.filter((x) => x !== who) };
         after = () => say('', `${who.name} left the lobby`, true);
-      } else if (r > 0.93 && m.some((x) => !x.host)) {
-        const talker = pickOf(m.filter((x) => !x.host));
-        after = () => say(talker.name, chatLine(Math.random() < 0.5 ? 'idle' : 'question'));
+      } else if (r > 0.93 && m.some((x) => !x.host && !x.bot)) {
+        // Only fake players chat in the lobby; bots stay silent
+        const talker = pickOf(m.filter((x) => !x.host && !x.bot));
+        after = () => say(talker.name, chatLine(Math.random() < 0.5 ? 'idle' : 'question', { region: talker.region ?? c.region }));
       } else {
-        next = { ...l, members: m.map((x) => (x.host ? x : { ...x, ping: Math.max(8, x.ping + Math.round((Math.random() - 0.5) * 6)) })) };
+        next = {
+          ...l,
+          members: m.map((x) => {
+            if (x.host || x.bot) return x;
+            const basePing = pingFor(c.region, x.region ?? c.region);
+            return { ...x, ping: Math.max(6, Math.round(x.ping * 0.75 + basePing * 0.25 + (Math.random() - 0.5) * 3)) };
+          }),
+        };
       }
       if (next) {
         const committed = next;
@@ -130,13 +142,13 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
     say(lobby.members[0].name, t);
     setMsg('');
     sfx.ui();
-    const others = lobby.members.filter((m) => !m.host);
+    const others = lobby.members.filter((m) => !m.host && !m.bot);
     if (others.length && Math.random() < 0.6) setTimeout(() => say(pickOf(others).name, pickOf(['lol', 'true', 'ok', 'gg', 'haha', 'sure', 'yep', '👍', 'start it!'])), 900 + Math.random() * 1500);
   };
   const kick = (name: string) => {
     sfx.back();
     setLobby((l) => ({ ...l, members: l.members.filter((m) => m.name !== name) }));
-    say('', `${name} was kicked by the host`, true);
+    say('', `${name} left the lobby`, true);
   };
   const fill = () => {
     setLobby((l) => {
@@ -148,20 +160,23 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
       }
       return { ...l, members: [...l.members, ...add] };
     });
-    say('', 'Host filled empty slots with bots', true);
   };
   const invite = () => {
     const used = new Set(lobby.members.map((m) => m.name));
     const name = genPlayerName(used);
-    const region = c.region;
-    setLobby((l) => ({ ...l, members: [...l.members, { name, ping: pingFor(region, region) + Math.floor(Math.random() * 12), ready: false, invited: true, region }] }));
-    say('', `${name} was invited by the host`, true);
-    setTimeout(() => say(name, chatLine('join', { region })), 900);
+    const pr = Math.random() < 0.75 ? c.region : pickOf(['EU', 'NA', 'AS', 'SA', 'OC']);
+    setLobby((l) => ({ ...l, members: [...l.members, { name, ping: pingFor(c.region, pr), ready: false, invited: true, region: pr }] }));
+    say('', `${name} joined the lobby`, true);
+    setTimeout(() => say(name, chatLine('join', { region: pr })), 800);
     sfx.ui();
   };
   const setRegion = (region: string) => {
-    setLobby((l) => ({ ...l, config: { ...l.config, region }, members: l.members.map((m) => ({ ...m, ping: m.bot ? 0 : pingFor(region, m.region ?? region) })) }));
-    say('', `Region changed to ${region} — pings recalculated`, true);
+    // Switching server region updates remote players' pings to the new region, while host ping stays untouched
+    setLobby((l) => ({
+      ...l,
+      config: { ...l.config, region },
+      members: l.members.map((m) => (m.host || m.bot ? m : { ...m, ping: pingFor(region, m.region ?? region) })),
+    }));
     sfx.ui();
   };
   const ready = lobby.members.filter((m) => m.ready).length;
@@ -185,18 +200,26 @@ export function LobbyRoom({ lobby, setLobby, onStart, onEdit, onClose }: { lobby
           <Btn variant="ghost" size="sm" onClick={invite} disabled={lobby.members.length >= c.maxPlayers || count !== null}>+ Invite</Btn>
           <Btn variant="ghost" size="sm" onClick={fill} disabled={lobby.members.length >= target || count !== null}>Fill bots</Btn>
           <Btn variant="ghost" size="sm" onClick={() => setDetails(true)}>🗺 Map</Btn>
+          <Btn variant="cyan" size="sm" onClick={onWarmup} disabled={count !== null} title="Roam the arena with lobby players before starting the match">
+            🏃 Enter map
+          </Btn>
           <Btn variant="primary" onClick={() => setCount(3)} disabled={count !== null}>▶ Start match</Btn>
         </div>
       </div>
       <div className="flex min-h-0 flex-1 flex-col gap-3 lg:flex-row">
         <div className="cut glass neon-border flex min-h-0 flex-col lg:w-[22rem]">
-          <div className="relative shrink-0">
-            <MapPreview key={level.key} level={level} size={220} className="max-h-48 lg:max-h-none" />
+          <button
+            type="button"
+            title="Click to inspect map"
+            onClick={() => { sfx.ui(); setDetails(true); }}
+            className="group relative shrink-0 overflow-hidden text-left"
+          >
+            <MapPreview key={level.key} level={level} size={220} className="max-h-48 transition group-hover:scale-[1.02] lg:max-h-none" />
             <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink to-transparent p-3 pt-8">
               <div className="font-display text-sm font-extrabold uppercase tracking-wider">{c.map === 'random' ? `🎲 ${level.name}` : level.name}</div>
               <div className="text-[11px] text-white/55">{level.tagline}</div>
             </div>
-          </div>
+          </button>
           <div className="space-y-2 p-3">
             <RuleChips server={server} />
             <div className="text-center text-xs text-white/50">{MODES[c.mode].desc} {fmtTime(c.timeLimit)} time limit.</div>

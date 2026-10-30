@@ -18,6 +18,7 @@ type Screen = 'menu' | 'servers' | 'custom' | 'lobby' | 'game';
 interface Session {
   server: ServerInfo;
   bots: number;
+  warmup?: boolean;
   key: number;
 }
 
@@ -39,7 +40,7 @@ export default function App() {
   });
   const [screen, setScreen] = useState<Screen>('menu');
   const simRef = useRef<ServerSim | null>(null);
-  if (!simRef.current) simRef.current = new ServerSim(180);
+  if (!simRef.current) simRef.current = new ServerSim(220);
   const sim = simRef.current;
   const [servers, setServers] = useState<ServerInfo[]>(() => [...sim.servers]);
   const [online, setOnline] = useState(sim.online);
@@ -122,7 +123,15 @@ export default function App() {
   const startLobby = useCallback(() => {
     const l = lobbyRef.current;
     if (!l) return;
-    setSession({ server: lobbyToServer(l), bots: l.members.length - 1, key: ++keyRef.current });
+    setSession({ server: lobbyToServer(l), bots: l.members.length - 1, warmup: false, key: ++keyRef.current });
+    setScreen('game');
+  }, []);
+
+  const startWarmup = useCallback(() => {
+    const l = lobbyRef.current;
+    if (!l) return;
+    const fakeCount = l.members.filter((m) => !m.bot && !m.host).length;
+    setSession({ server: lobbyToServer(l), bots: fakeCount, warmup: true, key: ++keyRef.current });
     setScreen('game');
   }, []);
 
@@ -190,9 +199,10 @@ export default function App() {
             if (editing && lobby) {
               const keep = lobby.members.filter((m) => m.host || m.bot || m.invited || !c.password).slice(0, c.maxPlayers);
               setLobbyState({
-                ...lobby, config: c,
+                ...lobby,
+                config: c,
                 resolved: c.map === 'random' ? LEVEL_IDS[Math.floor(Math.random() * LEVEL_IDS.length)] : lobby.resolved,
-                members: keep.map((m) => ({ ...m, ping: m.bot ? 0 : pingFor(c.region, m.region ?? c.region) })),
+                members: keep.map((m) => (m.host || m.bot ? m : { ...m, ping: pingFor(c.region, m.region ?? c.region) })),
               });
             }
             else setLobbyState(newLobby(c, settings.name));
@@ -205,6 +215,7 @@ export default function App() {
           lobby={lobby}
           setLobby={setLobby}
           onStart={startLobby}
+          onWarmup={startWarmup}
           onEdit={() => { setEditing(true); setScreen('custom'); }}
           onClose={() => { setLobbyState(null); setScreen('menu'); }}
         />
@@ -214,6 +225,7 @@ export default function App() {
           key={session.key}
           server={session.server}
           bots={session.bots}
+          warmup={session.warmup}
           settings={settings}
           onSettings={setSettings}
           touch={touch}
@@ -225,6 +237,19 @@ export default function App() {
           onServers={toServers}
           onLobby={session.server.hosted ? toLobby : undefined}
           onCheats={session.server.hosted ? (allowed, c) => setLobby((l) => ({ ...l, config: { ...l.config, cheatsOn: allowed, cheats: c } })) : undefined}
+          onMapChange={
+            session.server.hosted
+              ? (lvl, gen) =>
+                  setLobby((l) => ({
+                    ...l,
+                    config: {
+                      ...l.config,
+                      map: lvl,
+                      gen: gen ? { ...l.config.gen, ...gen } : l.config.gen,
+                    },
+                  }))
+              : undefined
+          }
         />
       )}
       {scores && <Leaderboard onClose={() => setScores(false)} />}

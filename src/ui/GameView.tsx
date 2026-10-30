@@ -11,7 +11,7 @@ import { HostOptions } from './HostOptions';
 import { Btn } from './kit';
 
 export function GameView({
-  server, bots, settings, onSettings, touch, onLeave, onServers, onLobby, onCheats, fakeProfiles, botCount,
+  server, bots, settings, onSettings, touch, onLeave, onServers, onLobby, onCheats, onMapChange, fakeProfiles, botCount, warmup,
 }: {
   server: ServerInfo;
   bots: number;
@@ -22,8 +22,10 @@ export function GameView({
   onServers: () => void;
   onLobby?: () => void;
   onCheats?: (allowed: boolean, c: Cheats) => void;
+  onMapChange?: (level: ServerInfo['level'], gen?: ServerInfo['gen']) => void;
   fakeProfiles?: FakeProfile[];
   botCount?: number;
+  warmup?: boolean;
 }) {
   const mount = useRef<HTMLDivElement>(null);
   const engineRef = useRef<Engine | null>(null);
@@ -93,6 +95,7 @@ export function GameView({
         bots,
         botCount,
         fakeProfiles,
+        warmup,
         settings: settingsRef.current,
         touch,
         handlers: {
@@ -116,12 +119,12 @@ export function GameView({
             later(() => setShowResult(true), 1500);
             const entry: ScoreEntry = {
               name: settingsRef.current.name || 'Player', score: r.score, kills: r.kills, deaths: r.deaths, headshots: r.headshots,
-              mode: server.rules.mode, level: server.level, server: server.name, won: r.won, date: Date.now(),
+              mode: server.rules.mode, level: server.level, server: server.name, won: r.won, date: Date.now(), cheated: r.cheated,
             };
-            const rank = r.score > 0 && !r.cheated ? addScore(entry) : 0;
-            bumpProfile(r.kills, r.deaths, r.won);
+            const rank = r.score > 0 ? addScore(entry, r.cheated) : 0;
+            if (!r.cheated) bumpProfile(r.kills, r.deaths, r.won);
             setPlaced(rank);
-            setTop(loadScores());
+            setTop(loadScores(r.cheated));
           },
         },
       });
@@ -194,7 +197,9 @@ export function GameView({
       {phase === 'paused' && (
         <PauseOverlay
           server={server}
+          warmup={engine?.warmup}
           onResume={() => engine?.resume()}
+          onStartMatch={engine?.warmup ? () => engine.startMatchFromWarmup() : undefined}
           onRestart={() => engine?.restart()}
           onSettings={() => setShowSettings(true)}
           onLeave={onLobby ?? onLeave}
@@ -213,6 +218,7 @@ export function GameView({
             onCheats?.(v, v ? engine.cheats : { ...NO_CHEATS });
           }}
           onCheats={(c) => onCheats?.(cheatsAllowed, c)}
+          onMapChange={onMapChange}
           onClose={() => setHostOpen(false)}
         />
       )}

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import type { Box, LevelData } from './levels';
+import type { Box, LevelData, Theme } from './levels';
 import { mulberry32 } from './levels';
 
 const CORNERS: [number, number, number][][] = [
@@ -105,8 +105,10 @@ function gridTextures(aniso: number) {
 
 export interface LevelObjects {
   group: THREE.Group;
+  main: THREE.Mesh;
   dispose: () => void;
   update: (t: number, cam: THREE.Vector3, sunDir: THREE.Vector3) => void;
+  applyTheme: (th: Theme) => void;
   sky: THREE.Mesh;
   sun: THREE.Mesh;
   pads: THREE.Group[];
@@ -241,6 +243,36 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
     });
   };
 
+  const applyTheme = (nt: Theme) => {
+    mat.emissive.setHex(nt.accent);
+    outerMat.color.setHex(nt.fog).multiplyScalar(0.6);
+    const nTop = new THREE.Color(nt.skyTop);
+    const nBot = new THREE.Color(nt.skyBottom);
+    const nFog = new THREE.Color(nt.fog);
+    const cAttr = sg.getAttribute('color') as THREE.BufferAttribute;
+    for (let i = 0; i < sg.attributes.position.count; i++) {
+      const y = sg.attributes.position.getY(i) / 700;
+      if (y >= 0) tmp.copy(nBot).lerp(nTop, Math.pow(Math.min(1, y * 1.4), 0.65));
+      else tmp.copy(nBot).lerp(nFog, Math.min(1, -y * 3));
+      cAttr.setXYZ(i, tmp.r, tmp.g, tmp.b);
+    }
+    cAttr.needsUpdate = true;
+
+    sctx.globalCompositeOperation = 'source-over';
+    sctx.clearRect(0, 0, 256, 256);
+    const nGr = sctx.createLinearGradient(0, 20, 0, 236);
+    nGr.addColorStop(0, '#ffffff');
+    nGr.addColorStop(0.5, '#' + new THREE.Color(nt.discColor).getHexString());
+    nGr.addColorStop(1, '#' + new THREE.Color(nt.accent).getHexString());
+    sctx.fillStyle = nGr;
+    sctx.beginPath();
+    sctx.arc(128, 128, 110, 0, Math.PI * 2);
+    sctx.fill();
+    sctx.globalCompositeOperation = 'destination-out';
+    for (let i = 0; i < 7; i++) sctx.fillRect(0, 130 + i * 16, 256, 2 + i * 1.6);
+    sunTex.needsUpdate = true;
+  };
+
   const dispose = () => {
     group.traverse((o) => {
       const m = o as THREE.Mesh;
@@ -253,7 +285,7 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
     sunTex.dispose();
   };
 
-  return { group, dispose, update, sky, sun, pads };
+  return { group, main, dispose, update, applyTheme, sky, sun, pads };
 }
 
 /* --------------------------------------------------------------- 2D top-down map */

@@ -5,6 +5,7 @@ import { getLevel } from '@/game/levels';
 import { loadProfile, loadScores } from '@/game/storage';
 import { randomPlayerName } from '@/game/names';
 import { Btn, Logo, MapPreview, sfx } from './kit';
+import { MapDetails } from './MapDetails';
 
 export function Menu({
   settings, onName, onQuick, onServers, onCustom, onScores, onSettings, onHelp, hosting, online,
@@ -21,10 +22,12 @@ export function Menu({
   onHelp: () => void;
 }) {
   const [idx, setIdx] = useState(() => Math.floor(Math.random() * LEVEL_IDS.length));
+  const [inspectOpen, setInspectOpen] = useState(false);
   const profile = loadProfile();
   const best = loadScores()[0];
 
   useEffect(() => {
+    if (inspectOpen) return;
     const b = setInterval(() => setIdx((i) => (i + 1) % LEVEL_IDS.length), 4500);
     const k = (e: KeyboardEvent) => {
       if (e.key === 'Enter' && !(e.target instanceof HTMLInputElement)) onQuick();
@@ -34,7 +37,7 @@ export function Menu({
       clearInterval(b);
       window.removeEventListener('keydown', k);
     };
-  }, [onQuick]);
+  }, [onQuick, inspectOpen]);
 
   const level = getLevel(LEVEL_IDS[idx]);
 
@@ -94,11 +97,21 @@ export function Menu({
               ))}
             </div>
           </div>
-          <div className="cut glass neon-border overflow-hidden">
+          <button
+            type="button"
+            title="Click to inspect arena layout"
+            onClick={() => { sfx.ui(); setInspectOpen(true); }}
+            className="cut glass neon-border group overflow-hidden text-left transition hover:shadow-[0_0_0_1px_#2de2ff]"
+          >
             <div className="relative">
-              <MapPreview key={level.id} level={level} size={260} className="fade-in opacity-90" />
-              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink via-ink/80 to-transparent p-3 pt-10">
-                <div className="font-display text-[10px] font-bold uppercase tracking-[0.3em] text-neon-pink">4 large arenas</div>
+              <MapPreview key={level.id} level={level} size={260} className="fade-in opacity-90 transition group-hover:scale-[1.02] group-hover:opacity-100" />
+              <div className="absolute right-2 top-2 cut-sm bg-ink/85 px-2 py-0.5 font-display text-[9px] font-bold uppercase tracking-wider text-neon-cyan group-hover:bg-neon-cyan group-hover:text-ink">
+                🔍 Inspect
+              </div>
+              <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink via-ink/85 to-transparent p-3 pt-10">
+                <div className="font-display text-[10px] font-bold uppercase tracking-[0.3em] text-neon-pink">
+                  {level.size} m · {level.boxes.length} structures · {level.pads.length} pads
+                </div>
                 <div className="font-display text-base font-extrabold uppercase tracking-wider text-white">{level.name}</div>
                 <div className="text-xs text-white/60">{level.tagline}</div>
               </div>
@@ -108,12 +121,13 @@ export function Menu({
                 <div key={id} className={'h-1 flex-1 transition-colors ' + (i === idx ? 'bg-neon-pink' : 'bg-line')} />
               ))}
             </div>
-          </div>
+          </button>
         </div>
       </div>
       <div className="pointer-events-none absolute bottom-2 left-0 right-0 text-center text-[10px] uppercase tracking-[0.3em] text-white/30">
         Slide · Dash · Wall-jump · Rocket-jump
       </div>
+      {inspectOpen && <MapDetails level={level} onClose={() => setInspectOpen(false)} />}
     </div>
   );
 }

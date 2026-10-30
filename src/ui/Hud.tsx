@@ -72,7 +72,10 @@ function scoreSlots(hud: HudState, settings: Settings): [Slot, Slot] {
 function ModeStrip({ hud }: { hud: HudState }) {
   let text: string | null = null;
   let color = '#ffffff';
-  if (hud.mode === 'koth') {
+  if (hud.warmup) {
+    text = 'WARMUP · PRE-MATCH ROAM — DAMAGE & SCORING DISABLED (PAUSE [P] FOR HOST / START OPTIONS)';
+    color = '#2de2ff';
+  } else if (hud.mode === 'koth') {
     text = `HILL · ${hud.hillOwner || 'NEUTRAL'}${hud.hill ? ' · YOU ARE SCORING' : ''}`;
     color = hud.hillOwner === 'CYAN' ? TEAM[0] : hud.hillOwner === 'MAGENTA' ? TEAM[1] : hud.hillOwner === 'CONTESTED' ? '#ffffff' : '#ffe14d';
   } else if (hud.mode === 'ctf') {
@@ -118,6 +121,7 @@ export function Hud({
   const mini = useRef<HTMLCanvasElement>(null);
   const esp = useRef<HTMLCanvasElement>(null);
   const espDrawn = useRef(false);
+  const boardListRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     let raf = 0;
@@ -152,18 +156,23 @@ export function Hud({
               ctx.textAlign = 'center';
               for (const e of engine.getEsp(w, hh)) {
                 const bw = e.h * 0.45;
-                ctx.strokeStyle = 'rgba(255,59,92,0.9)';
-                ctx.lineWidth = 1.5;
+                ctx.strokeStyle = e.shootable ? 'rgba(125,255,107,0.95)' : 'rgba(255,59,92,0.9)';
+                ctx.lineWidth = e.shootable ? 2 : 1.5;
                 ctx.strokeRect(e.x - bw / 2, e.y, bw, e.h);
                 ctx.fillStyle = '#7dff6b';
                 ctx.fillRect(e.x - bw / 2 - 5, e.y + e.h * (1 - e.hp / 100), 3, e.h * (e.hp / 100));
-                ctx.fillStyle = '#ffffff';
+                ctx.fillStyle = e.shootable ? '#7dff6b' : '#ffffff';
                 ctx.fillText(`${e.name} · ${Math.round(e.d)}m`, e.x, e.y - 4);
               }
             }
           }
           espDrawn.current = on;
         }
+      }
+
+      if (engine.boardScroll !== 0) {
+        if (boardListRef.current) boardListRef.current.scrollTop += engine.boardScroll;
+        engine.boardScroll = 0;
       }
 
       // damage direction arc
@@ -223,7 +232,7 @@ export function Hud({
 
       <canvas ref={esp} className="absolute inset-0 h-full w-full" />
       {hud?.cheats && (
-        <div className="absolute left-1/2 top-[64px] -translate-x-1/2 cut-sm bg-neon-red/80 px-2 py-0.5 font-display text-[9px] font-black uppercase tracking-[0.25em]">Cheats active · score not recorded</div>
+        <div className="absolute left-1/2 top-[64px] -translate-x-1/2 cut-sm bg-neon-red/80 px-2 py-0.5 font-display text-[9px] font-black uppercase tracking-[0.25em]">Cheats active · cheats leaderboard</div>
       )}
       {/* damage indicators */}
       <canvas ref={ind} width={280} height={280} className="absolute left-1/2 top-1/2 -ml-[140px] -mt-[140px]" />
@@ -407,36 +416,38 @@ export function Hud({
       {/* scoreboard */}
       {board && hud && (
         <div className="absolute inset-0 flex items-center justify-center bg-black/40 p-3">
-          <div className="cut glass neon-border w-full max-w-2xl">
-            <div className="flex items-center justify-between border-b border-line/70 px-5 py-2">
-              <span className="font-display text-sm font-extrabold uppercase tracking-[0.3em]">Scoreboard</span>
-              <span className="font-display text-xs text-neon-yellow">{MODES[hud.mode].name} · {timed ? fmtTime(hud.timeLeft) : '∞'}</span>
+          <div className="cut glass neon-border flex max-h-[75vh] w-full max-w-2xl flex-col">
+            <div className="flex shrink-0 items-center justify-between border-b border-line/70 px-5 py-2">
+              <span className="font-display text-sm font-extrabold uppercase tracking-[0.3em]">Scoreboard ({rows.length})</span>
+              <span className="font-display text-xs text-neon-yellow">{MODES[hud.mode].name} · {hud.warmup ? 'WARMUP' : timed ? fmtTime(hud.timeLeft) : '∞'} · Scroll wheel to navigate</span>
             </div>
-            <table className="w-full text-sm">
-              <thead className="text-[10px] uppercase tracking-[0.2em] text-white/50">
-                <tr>
-                  <th className="px-4 py-1.5 text-left">Pilot</th>
-                  <th className="px-2 text-right">Kills</th>
-                  <th className="px-2 text-right">Deaths</th>
-                  <th className="px-2 text-right">Points</th>
-                  <th className="px-4 text-right">Ping</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows.map((r) => (
-                  <tr key={r.id} className={cn('border-t border-line/30', r.isPlayer && 'bg-neon-pink/20 font-bold', !r.alive && 'opacity-60')}>
-                    <td className="px-4 py-1">
-                      <span className="mr-2 inline-block h-2 w-2" style={{ background: isTeamMode(hud.mode) ? TEAM[r.team] : r.isPlayer ? '#ff2d95' : '#6a5aa8' }} />
-                      {r.name}
-                    </td>
-                    <td className="px-2 text-right font-display">{r.kills}</td>
-                    <td className="px-2 text-right font-display">{r.deaths}</td>
-                    <td className="px-2 text-right font-display text-neon-cyan">{r.score}</td>
-                    <td className="px-4 text-right font-display text-white/60">{r.ping}</td>
+            <div ref={boardListRef} className="nscroll min-h-0 flex-1 overflow-y-auto">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 bg-panel text-[10px] uppercase tracking-[0.2em] text-white/50">
+                  <tr>
+                    <th className="px-4 py-1.5 text-left">Pilot</th>
+                    <th className="px-2 text-right">Kills</th>
+                    <th className="px-2 text-right">Deaths</th>
+                    <th className="px-2 text-right">Points</th>
+                    <th className="px-4 text-right">Ping</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.id} className={cn('border-t border-line/30', r.isPlayer && 'bg-neon-pink/20 font-bold', !r.alive && 'opacity-60')}>
+                      <td className="px-4 py-1">
+                        <span className="mr-2 inline-block h-2 w-2" style={{ background: isTeamMode(hud.mode) ? TEAM[r.team] : r.isPlayer ? '#ff2d95' : '#6a5aa8' }} />
+                        {r.name}
+                      </td>
+                      <td className="px-2 text-right font-display">{r.kills}</td>
+                      <td className="px-2 text-right font-display">{r.deaths}</td>
+                      <td className="px-2 text-right font-display text-neon-cyan">{r.score}</td>
+                      <td className="px-4 text-right font-display text-white/60">{r.ping}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
       )}

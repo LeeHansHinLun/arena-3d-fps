@@ -76,6 +76,8 @@ export class Fighter {
   region = 'EU';
   carrying = -1;
   hillT = 0;
+  espVisible = false;
+  espVisT = 0;
 
   constructor(public id: number, public name: string, public team: number, public isPlayer: boolean, public color: number, kind: 'player' | 'fake' | 'bot' = 'bot') {
     this.kind = kind;
@@ -142,17 +144,55 @@ function visorMat(c: number) {
 
 function nameTexture(name: string, color: number) {
   const c = document.createElement('canvas');
-  c.width = 256;
-  c.height = 64;
+  c.width = 384;
+  c.height = 84;
   const g = c.getContext('2d')!;
-  g.font = '700 34px Rajdhani, "Segoe UI", system-ui, sans-serif';
+  const accent = '#' + new THREE.Color(color).lerp(new THREE.Color(0xffffff), 0.25).getHexString();
+  const bright = '#' + new THREE.Color(color).lerp(new THREE.Color(0xffffff), 0.65).getHexString();
+  g.font = '700 32px Rajdhani, "Segoe UI", system-ui, sans-serif';
+  const tw = Math.min(310, Math.max(120, g.measureText(name).width));
+  const pw = tw + 48;
+  const px = (384 - pw) / 2;
+  const py = 14;
+  const ph = 56;
+  const cut = 10;
+
+  // Angled badge backdrop
+  g.beginPath();
+  g.moveTo(px, py);
+  g.lineTo(px + pw - cut, py);
+  g.lineTo(px + pw, py + cut);
+  g.lineTo(px + pw, py + ph);
+  g.lineTo(px + cut, py + ph);
+  g.lineTo(px, py + ph - cut);
+  g.closePath();
+  g.fillStyle = 'rgba(10, 5, 24, 0.84)';
+  g.fill();
+  g.lineWidth = 2.5;
+  g.strokeStyle = accent;
+  g.stroke();
+
+  // Bottom accent bar
+  g.fillStyle = accent;
+  g.fillRect(px + cut, py + ph - 4, pw - cut, 4);
+
+  // Diamond team/status pip
+  g.save();
+  g.translate(px + 18, py + ph / 2 - 1);
+  g.rotate(Math.PI / 4);
+  g.fillStyle = bright;
+  g.fillRect(-5, -5, 10, 10);
+  g.restore();
+
+  // Crisp text
   g.textAlign = 'center';
   g.textBaseline = 'middle';
-  g.lineWidth = 7;
-  g.strokeStyle = 'rgba(8,4,24,0.9)';
-  g.strokeText(name, 128, 34);
-  g.fillStyle = '#' + new THREE.Color(color).lerp(new THREE.Color(0xffffff), 0.35).getHexString();
-  g.fillText(name, 128, 34);
+  g.lineWidth = 4;
+  g.strokeStyle = 'rgba(4, 2, 12, 0.95)';
+  g.strokeText(name, 192 + 7, py + ph / 2);
+  g.fillStyle = '#ffffff';
+  g.fillText(name, 192 + 7, py + ph / 2);
+
   const t = new THREE.CanvasTexture(c);
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
@@ -183,9 +223,17 @@ export class BotView {
     this.bodyM.add(visor);
     this.group.add(this.bodyM, this.legL, this.legR);
     this.group.scale.setScalar(1.08);
-    this.sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: nameTexture(name, nameColor), transparent: true, depthWrite: false }));
-    this.sprite.scale.set(2.3, 0.575, 1);
-    this.sprite.position.y = 2.2;
+    // sizeAttenuation: false keeps the nameplate at a fixed screen size regardless of distance
+    this.sprite = new THREE.Sprite(
+      new THREE.SpriteMaterial({
+        map: nameTexture(name, nameColor),
+        transparent: true,
+        depthWrite: false,
+        sizeAttenuation: false,
+      }),
+    );
+    this.sprite.scale.set(0.14, 0.031, 1);
+    this.sprite.position.y = 2.15;
     this.group.add(this.sprite);
     this.group.visible = false;
   }
@@ -217,12 +265,12 @@ export class BotView {
       this.bodyM.material = flashMat!;
     } else this.bodyM.material = this.mat;
     const d = Math.hypot(b.x - camX, b.y - camY, b.z - camZ);
-    this.sprite.visible = showName && d < 48;
+    this.sprite.visible = showName && d < 56;
     const far = d > 55;
     this.bodyM.castShadow = !far;
     this.legL.castShadow = !far;
     this.legR.castShadow = !far;
-    (this.sprite.material as THREE.SpriteMaterial).opacity = Math.max(0, Math.min(1, 1.6 - d / 28));
+    (this.sprite.material as THREE.SpriteMaterial).opacity = Math.max(0, Math.min(1, 1.75 - d / 34));
   }
 
   dispose() {

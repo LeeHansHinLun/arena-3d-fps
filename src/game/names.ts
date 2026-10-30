@@ -12,28 +12,36 @@ const CALLSIGNS = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Gol
 const BOT_PREFIX = ['BOT', 'SIM', 'CPU', 'AI', 'DRONE', 'UNIT', 'CLONE', 'BOT', 'SIM', 'CPU', 'AI', 'DRONE', 'UNIT', 'CLONE'];
 const BOT_SUFFIX = ['MK1', 'MK2', 'MK3', 'MK4', 'MK5', 'MK6', 'MK7', 'MK8', 'MK9', 'MK10', 'X', 'Z', 'Q', 'R', 'S', 'T', 'V', 'W', 'Y', 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'U'];
 
+const TAGS = ['TV', 'XD', 'TT', 'GG', 'WP', 'NT', 'EZ', 'X', 'Z', 'Q', 'PRO', 'MVP'];
+const TRAIL_NUMS = ['2', '3', '7', '9', '11', '13', '17', '19', '21', '23', '27', '33', '42', '55', '64', '77', '88', '99', '101', '404', '777', '808'];
+
 const pick = <T,>(a: T[]): T => a[Math.floor(Math.random() * a.length)];
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
 export function genPlayerName(used?: Set<string>): string {
+  void SUFFIX;
   for (let i = 0; i < 60; i++) {
     const a = pick(ADJ);
     const n = pick(NOUN);
     const r = Math.random();
     let name: string;
-    if (r < 0.42) name = `${a} ${n}`;
+    if (r < 0.38) name = `${a} ${n}`;
     else if (r < 0.62) name = `${a}${n}`;
-    else if (r < 0.76) name = `${a}_${n}`;
-    else if (r < 0.86) name = `${n}${pick(SUFFIX)}`;
-    else if (r < 0.94) name = `${a} ${n} ${pick(SUFFIX)}`;
+    else if (r < 0.78) name = `${a}_${n}`;
+    else if (r < 0.88) name = `${a}${n}_${pick(TAGS)}`;
     else name = `${pick(CALLSIGNS)} ${n}`;
+    // ~12% chance of a trailing number so some names have numbers without overdoing it
+    if (Math.random() < 0.12) {
+      const sep = name.includes('_') || !name.includes(' ') ? '' : ' ';
+      name = `${name}${sep}${pick(TRAIL_NUMS)}`;
+    }
     name = name.replace(/\s+/g, ' ').trim().slice(0, 18);
     if (!used || !used.has(name)) {
       used?.add(name);
       return name;
     }
   }
-  const fallback = `${pick(ADJ)} ${pick(NOUN)} ${Math.floor(Math.random() * 90 + 10)}`;
+  const fallback = `${pick(ADJ)}${pick(NOUN)}${pick(TRAIL_NUMS)}`.slice(0, 18);
   used?.add(fallback);
   return fallback;
 }
@@ -91,19 +99,26 @@ const CHAT: Record<ChatKind, string[]> = {
 
 export function chatLine(kind: ChatKind, vars: Record<string, string> = {}): string {
   let s = pick(CHAT[kind]);
-  for (const [k, v] of Object.entries(vars)) s = s.replace(new RegExp(`\\{${k}\\}`, 'g'), v);
+  const merged: Record<string, string> = { region: 'EU', map: 'this map', mode: 'this mode', ...vars };
+  for (const [k, v] of Object.entries(merged)) {
+    if (v) s = s.replace(new RegExp(`\\{${k}\\}`, 'g'), v);
+  }
+  s = s.replace(/\{[a-zA-Z]+\}/g, 'here');
   return cap(s);
 }
 
 export const MOTDS = [
-  'Welcome! Be nice, frag hard.', 'No camping the tower. Rails are fair game.', 'Server restarts every 6 hours. Have fun!',
-  'Join our Discord: discord.gg/neonriot', 'Slide, dash, wall-jump. Movement wins matches.', 'Casual lobby. Newbies welcome.',
-  'Competitive rules. Be ready to sweat.', 'Tip: slide-hop to keep your speed.', 'This server runs procedural maps. Vote with your feet.',
-  'No cheats unless the host enables them.', 'Region: {region}. Ping may vary. GL HF!', 'Custom lobbies welcome. Ask the host.',
-  'KOTH rules: hold the hill, bank the points.', 'CTF: grab the flag, bring it home.', 'Bounty is live. Watch your back.',
-  'Survival mode: endless waves, no mercy.', 'Duel only. No excuses.', 'Instagib: one shot, one kill.',
-  'Please do not team up in FFA.', 'Report bugs to the host. Have fun!',
-  'This server is hosted by a player, not a company.', 'New map rotation every hour.', 'Movement tech is allowed. Have fun with it.',
-  'If you see a bot, it is probably a bot.', 'Be excellent to each other.', 'No spawn camping. Seriously.', 'Good luck, have fun.',
+  'Welcome! Be nice, frag hard.',
+  'No camping the tower. Rails are fair game.',
+  'Server restarts every 6 hours. Have fun!',
+  'Join our Discord: discord.gg/neonriot',
+  'Slide, dash, wall-jump. Movement wins matches.',
+  'Tip: slide-hop to keep your speed.',
+  'No cheats unless the host enables them.',
+  'Hosted in {region}. Good luck, have fun!',
+  'New map rotation every hour.',
+  'Movement tech is allowed. Have fun with it.',
+  'Be excellent to each other.',
+  'No spawn camping. Seriously.',
 ];
 
