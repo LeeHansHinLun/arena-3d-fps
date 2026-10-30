@@ -141,6 +141,40 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
   halo.frustumCulled = false;
   group.add(halo);
 
+  // The box colors are baked into the vertex colors at build time, so keep the originals around:
+  // a theme change has to re-derive them instead of leaving the old palette in the arena.
+  const baseMain = (geo.getAttribute('color') as THREE.BufferAttribute).array.slice() as Float32Array;
+  const baseGlow = (gGeo.getAttribute('color') as THREE.BufferAttribute).array.slice() as Float32Array;
+  const baseHalo = (hGeo.getAttribute('color') as THREE.BufferAttribute).array.slice() as Float32Array;
+  let curTheme = th;
+  let totalHueShift = 0;
+  const hslTmp = { h: 0, s: 0, l: 0 };
+  const colTmp = new THREE.Color();
+  const hueOf = (hex: number) => {
+    colTmp.setHex(hex);
+    colTmp.getHSL(hslTmp);
+    return hslTmp.h;
+  };
+  const wrapHue = (h: number) => {
+    h %= 1;
+    if (h > 0.5) h -= 1;
+    if (h < -0.5) h += 1;
+    return h;
+  };
+  const recolor = (mesh: THREE.Mesh, base: Float32Array, shift: number) => {
+    const attr = mesh.geometry.getAttribute('color') as THREE.BufferAttribute;
+    const arr = attr.array as Float32Array;
+    for (let i = 0; i < arr.length; i += 3) {
+      colTmp.setRGB(base[i], base[i + 1], base[i + 2]);
+      colTmp.getHSL(hslTmp);
+      colTmp.setHSL((hslTmp.h + shift + 1) % 1, hslTmp.s, hslTmp.l);
+      arr[i] = colTmp.r;
+      arr[i + 1] = colTmp.g;
+      arr[i + 2] = colTmp.b;
+    }
+    attr.needsUpdate = true;
+  };
+
   // outer ground
   const outerMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(th.fog).multiplyScalar(0.6) });
   const outer = new THREE.Mesh(new THREE.PlaneGeometry(2400, 2400), outerMat);
@@ -210,23 +244,27 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
 
   // pads
   const pads: THREE.Group[] = [];
+  const padColors: { mat: THREE.MeshBasicMaterial; hex: number }[] = [];
   const discGeo = new THREE.CylinderGeometry(1.5, 1.6, 0.12, 14);
   const innerGeo = new THREE.CylinderGeometry(0.9, 0.9, 0.16, 14);
   const beamGeo = new THREE.CylinderGeometry(1.3, 1.5, 9, 14, 1, true);
   for (const p of level.pads) {
     const g = new THREE.Group();
     g.position.set(p.x, p.y, p.z);
-    const d = new THREE.Mesh(discGeo, new THREE.MeshBasicMaterial({ color: p.color, toneMapped: false }));
+    const dMat = new THREE.MeshBasicMaterial({ color: p.color, toneMapped: false });
+    const bMat = new THREE.MeshBasicMaterial({ color: p.color, transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, toneMapped: false });
+    const d = new THREE.Mesh(discGeo, dMat);
     d.position.y = 0.06;
     const inn = new THREE.Mesh(innerGeo, new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false }));
     inn.position.y = 0.07;
-    const beam = new THREE.Mesh(beamGeo, new THREE.MeshBasicMaterial({ color: p.color, transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide, toneMapped: false }));
+    const beam = new THREE.Mesh(beamGeo, bMat);
     beam.position.y = 4.5;
     beam.name = 'beam';
     inn.name = 'inner';
     g.add(d, inn, beam);
     group.add(g);
     pads.push(g);
+    padColors.push({ mat: dMat, hex: p.color }, { mat: bMat, hex: p.color });
   }
 
   const update = (t: number, cam: THREE.Vector3, sunDir: THREE.Vector3) => {
@@ -246,6 +284,18 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
   const applyTheme = (nt: Theme) => {
     mat.emissive.setHex(nt.accent);
     outerMat.color.setHex(nt.fog).multiplyScalar(0.6);
+    // rotate the baked box/glow palette with the theme accent so the arena matches the new sky
+    totalHueShift = wrapHue(totalHueShift + wrapHue(hueOf(nt.accent) - hueOf(curTheme.accent)));
+    recolor(main, baseMain, totalHueShift);
+    recolor(glow, baseGlow, totalHueShift);
+    recolor(halo, baseHalo, totalHueShift);
+    for (const pc of padColors) {
+      colTmp.setHex(pc.hex);
+      colTmp.getHSL(hslTmp);
+      colTmp.setHSL((hslTmp.h + totalHueShift + 1) % 1, hslTmp.s, hslTmp.l);
+      pc.mat.color.copy(colTmp);
+    }
+    curTheme = nt;
     const nTop = new THREE.Color(nt.skyTop);
     const nBot = new THREE.Color(nt.skyBottom);
     const nFog = new THREE.Color(nt.fog);

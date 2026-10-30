@@ -167,7 +167,7 @@ export const MODES: Record<ModeId, { name: string; short: string; desc: string; 
   duel: { name: 'Duel', short: '1V1', desc: 'One opponent, no excuses. First to the frag limit.', limits: [5, 10, 15], color: '#a26bff' },
   ctf: { name: 'Capture the Flag', short: 'CTF', desc: 'Grab the enemy flag and bring it home. Team captures win.', limits: [3, 5, 8], color: '#2de2ff', team: true, special: true, unit: 'captures' },
   koth: { name: 'King of the Hill', short: 'KOTH', desc: 'Hold the glowing hill to bank points. First to the limit wins.', limits: [60, 120, 180], color: '#ffe14d', special: true, unit: 'points' },
-  survival: { name: 'Survival', short: 'SURV', desc: 'Co-op wave survival. Fight off waves of hostile AI together.', limits: [5, 10, 15], color: '#7dff6b', special: true, unit: 'waves' },
+  survival: { name: 'Survival', short: 'SURV', desc: 'Co-op wave survival. One life for you, one life for every hostile — friendly AI redeploys, hostile waves do not. Clear waves to win.', limits: [5, 10, 15], color: '#7dff6b', special: true, unit: 'waves' },
   bounty: { name: 'Bounty', short: 'BOUNTY', desc: 'One pilot is marked. Only hunting the marked target scores points.', limits: [5, 10, 15], color: '#ff3b5c', special: true, unit: 'bounties' },
 };
 

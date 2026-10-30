@@ -27,6 +27,10 @@ export interface AIState {
   weapon: WeaponId;
   weaponT: number;
   jumpCd: number;
+  /** movement toolkit parity with the player: air jumps, wall jumps and jump-pad cooldown */
+  airJumps: number;
+  wallJumps: number;
+  padCd: number;
   wantX: number;
   wantZ: number;
 }
@@ -35,7 +39,7 @@ export function newAI(): AIState {
   return {
     path: [], pathIdx: 0, repathT: 0, target: null, seenT: -99, canSee: false, lastX: 0, lastY: 0, lastZ: 0,
     reactT: 0, scanT: Math.random() * 0.3, strafeDir: 1, strafeT: 0, px: 0, pz: 0, stuckT: 0, stuckN: 0,
-    fireCd: 0, burstLeft: 0, burstPause: 0, weapon: 'rifle', weaponT: 0, jumpCd: 0, wantX: 0, wantZ: 0,
+    fireCd: 0, burstLeft: 0, burstPause: 0, weapon: 'rifle', weaponT: 0, jumpCd: 0, airJumps: 1, wallJumps: 2, padCd: 0, wantX: 0, wantZ: 0,
   };
 }
 
@@ -244,6 +248,10 @@ export class BotView {
     const g = this.group;
     if (!f.alive) {
       g.visible = false;
+      // the update loop early-returns while dead, so the flash timer has to be dropped here:
+      // otherwise a respawned bot pops in bright white
+      this.flashT = 0;
+      this.bodyM.material = this.mat;
       return;
     }
     const b = f.body;

@@ -516,17 +516,19 @@ export function generateProcedural(seed: number, size: MapSize, opts?: { w?: num
     for (const [sx, sz] of [[1, 1], [-1, -1]]) L.padTo(sx * 5.5, 3, sz * 5.5, sx * 0.5, sz * 0.5, 9, neon[1]);
     cR = 15;
   }
-  // districts on a grid
+  // districts on a grid — one axis per arena dimension so asymmetric (W≠D) maps stay inside the bounds
   const cell = 22;
-  const n = Math.floor((D - 10) / cell);
-  const start = -((n - 1) * cell) / 2;
+  const nx = Math.max(1, Math.floor((W - 10) / cell));
+  const nz = Math.max(1, Math.floor((D - 10) / cell));
+  const startX = -((nx - 1) * cell) / 2;
+  const startZ = -((nz - 1) * cell) / 2;
   type B = { cx: number; cz: number; h: number; box: Box };
   const towers: B[][] = [];
-  for (let i = 0; i < n; i++) {
+  for (let i = 0; i < nx; i++) {
     towers[i] = [];
-    for (let j = 0; j < n; j++) {
-      const cx = start + i * cell + (L.r() - 0.5) * 3;
-      const cz = start + j * cell + (L.r() - 0.5) * 3;
+    for (let j = 0; j < nz; j++) {
+      const cx = startX + i * cell + (L.r() - 0.5) * 3;
+      const cz = startZ + j * cell + (L.r() - 0.5) * 3;
       if (Math.hypot(cx, cz) < cR + 9) continue;
       const roll = style === 'towers' ? L.r() * 0.75 : style === 'maze' ? 0.3 + L.r() * 0.7 : style === 'open' ? L.r() * 0.55 : L.r();
       const col = L.pick(T.cols);
@@ -566,8 +568,8 @@ export function generateProcedural(seed: number, size: MapSize, opts?: { w?: num
     }
   }
   // bridges between neighbouring towers of the same height
-  for (let i = 0; i < n - 1; i++) {
-    for (let j = 0; j < n; j++) {
+  for (let i = 0; i < nx - 1; i++) {
+    for (let j = 0; j < nz; j++) {
       const a = towers[i][j], b = towers[i + 1]?.[j];
       if (a && b && a.h === b.h && Math.abs(a.cz - b.cz) < 3) {
         const z = (a.cz + b.cz) / 2;
