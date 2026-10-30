@@ -153,6 +153,8 @@ const WALK = 7;
 const SPRINT = 10.6;
 const CROUCH_SPEED = 3.6;
 const JUMP_V = 8.8;
+/** spawn protection is a rule of the match, so the player and the bots share it */
+const SPAWN_PROTECT = 2;
 const TEAM_COLORS = [0x2de2ff, 0xff2d95];
 const BOT_COLORS = [0xff9a3c, 0xb26bff, 0x7dff6b, 0xffe14d, 0xff6ec7, 0x4dffd2, 0xff5a3c, 0x6b8cff, 0xe0e0ff, 0xff4d6d];
 const TAU = Math.PI * 2;
@@ -255,6 +257,8 @@ export class Engine {
   boardScroll = 0;
   minActiveAI = 6;
   private liveAIT = 0;
+  /** hostiles that the next Survival wave should add (spawned outside the fighter loop) */
+  private pendingHorde = 0;
   // special modes
   mode: ModeId = 'ffa';
   get coOp(): boolean {
@@ -474,6 +478,8 @@ export class Engine {
       warmup: this.warmup,
       hill: { x: 0, z: 0, r: this.hillR },
       pickups: this.pickups,
+      pads: this.level.pads,
+      fireInterval: (w) => this.defs[w]?.interval ?? 0,
       isEnemy: (a, b) => a !== b && (!this.teamMode || a.team !== b.team),
       fire: (f, t, w) => {
         // no shooting at all during warmup (damage is off, and explosions would still shove players)
@@ -826,8 +832,11 @@ export class Engine {
     this.setState('paused');
   }
 
-  /** Applies a new theme to sky, fog, sun and level materials in-place without respawning players. */
-  applyThemeOnly(th: Theme) {
+  /**
+   * Applies a new theme to sky, fog, sun and level materials in-place without respawning players.
+   * `recolorLevel` is skipped when the arena is rebuilt right after: the new mesh bakes the theme anyway.
+   */
+  applyThemeOnly(th: Theme, recolorLevel = true) {
     this.renderer.setClearColor(th.fog);
     (this.scene.fog as THREE.Fog).color.setHex(th.fog);
     this.hemi.color.setHex(th.hemiSky);
@@ -837,7 +846,7 @@ export class Engine {
     this.sunBase.copy(this.sunDir);
     this.rayCol.setHex(th.sunColor);
     // recolors the baked vertex colors of the level boxes / glow, not just the emissive tint
-    this.levelObjs.applyTheme(th);
+    if (recolorLevel) this.levelObjs.applyTheme(th);
     // the light direction changed: reposition the sun even if the player did not move
     this.sunDirty = true;
     const b = this.player?.body;
@@ -863,7 +872,8 @@ export class Engine {
     this.server = { ...this.server, level: levelId, gen };
     const next = getLevel(levelId, gen);
     this.level = next;
-    this.applyThemeOnly(next.theme);
+    const layoutChanged = !sameLayout;
+    this.applyThemeOnly(next.theme, !layoutChanged);
     if (sameLayout) {
       this.map = renderLevelMap(next, 256);
       this.emit({ type: 'announce', text: `THEME · ${next.themeName ?? 'UPDATED'}`, sub: next.name, tone: 'info' });
@@ -882,6 +892,7 @@ export class Engine {
     this.aiCtx.world = this.world;
     this.aiCtx.nav = this.nav;
     this.aiCtx.pickups = this.pickups;
+    this.aiCtx.pads = next.pads;
     // The objectives are tied to the old geometry: drop them before the new arena is used by the AI
     this.clearSpecialObjectives();
     this.setupSpecialMode();
@@ -974,7 +985,7 @@ export class Engine {
     }
     if (this.bountyMarker) {
       this.scene.remove(this.bountyMarker);
-      freeObject(this.bountyMarker);
+      freeTree(this.bountyMarker);
       this.bountyMarker = null;
     }
     for (const fl of this.flags) {
@@ -1022,6 +1033,50 @@ export class Engine {
     }
     if (this.aimResult?.f === f) this.aimResult = null;
     if (this.aimTarget === f) this.aimTarget = null;
+  }
+
+  /** Survival hostiles have one life, exactly like the player: they are retired, not respawned. */
+  private isSurvivalHostile(f: Fighter): boolean {
+    return this.mode === 'survival' && f.team === 1 && !f.isPlayer;
+  }
+
+  /** Drops fighters that were retired mid-round. Safe to call between frames, never during iteration. */
+  private pruneGoneFighters() {
+    let removed = false;
+    for (let i = this.fighters.length - 1; i >= 0; i--) {
+      const f = this.fighters[i];
+      if (!f.gone || f.isPlayer) continue;
+      if (f.view) {
+        this.scene.remove(f.view.group);
+        f.view.dispose();
+        f.view = null;
+      }
+      this.forgetFighter(f);
+      this.fighters.splice(i, 1);
+      removed = true;
+    }
+    if (removed) {
+      this.aiCtx.fighters = this.fighters;
+      this.scoreDirty = true;
+    }
+  }
+
+  /** Spawns the hostiles of a freshly cleared Survival wave (deferred out of the AI loop). */
+  private spawnPendingHorde() {
+    if (this.pendingHorde <= 0) return;
+    const target = Math.min(18, this.pendingHorde);
+    this.pendingHorde = 0;
+    if (this.mode !== 'survival' || this.over) return;
+    let live = this.fighters.filter((f) => f.team === 1 && !f.gone && !f.isPlayer).length;
+    let guard = 0;
+    while (live < target && guard++ < 24) {
+      const extra = this.makeBot(1, this.fighters.length);
+      this.fighters.push(extra);
+      this.aiCtx.fighters = this.fighters;
+      this.spawnFighter(extra);
+      live++;
+    }
+    this.scoreDirty = true;
   }
 
   /* ============================================================ match setup */
@@ -1102,10 +1157,10 @@ export class Engine {
       return team;
     };
     // Never conjure more opponents than the server's configured player limit allows.
-    const maxOpponents = Math.max(1, this.maxFighters() - 1);
-    const target = this.mode === 'duel' ? 1 : Math.min(this.botTarget, maxOpponents);
+    const maxOpponents = Math.max(0, this.maxFighters() - 1);
+    const target = Math.min(this.mode === 'duel' ? 1 : this.botTarget, maxOpponents);
     // Never conjure more opponents than the server actually has players for.
-    this.minActiveAI = this.coOp ? 6 : Math.min(6, Math.max(1, target));
+    this.minActiveAI = this.coOp ? 6 : Math.min(6, target);
     for (const prof of this.fakeProfiles.slice(0, target)) {
       this.fighters.push(this.makeFake(nextTeam(), prof.name, seedScores ? prof : { name: prof.name, region: prof.region, skill: prof.skill, frustration: prof.frustration }));
     }
@@ -1123,8 +1178,9 @@ export class Engine {
     }
     this.wave = 1;
     this.waveKills = 0;
+    this.pendingHorde = 0;
     if (this.coOp) {
-      const hordeCount = Math.max(6, Math.min(16, 4 + this.wave * 2));
+      const hordeCount = this.hordeSize();
       for (let i = 0; i < hordeCount; i++) this.fighters.push(this.makeBot(1, bi++));
     } else {
       while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
@@ -1174,6 +1230,11 @@ export class Engine {
     });
     this.emit({ type: 'chat', name: 'SERVER', text: `Connected to ${this.server.name} — ${this.server.motd}`, team: -1, system: true });
     audio.play('go');
+  }
+
+  /** Hostiles a Survival wave consists of (grows every wave, hard-capped at 18). */
+  private hordeSize(): number {
+    return Math.max(6, Math.min(18, 4 + this.wave * 2));
   }
 
   /** Hard cap on fighters in the world: the server's maxPlayers, never more than the engine limit. */
@@ -1275,7 +1336,7 @@ export class Engine {
     f.hp = f.isPlayer && this.cheats.oneHp ? 1 : 100;
     f.armor = 0;
     f.alive = true;
-    f.spawnProt = f.isPlayer ? 2.2 : 1.6;
+    f.spawnProt = SPAWN_PROTECT;
     f.killer = null;
     f.yaw = Math.atan2(-(0 - n.x), -(0 - n.z)) + (Math.random() - 0.5) * 1.2;
     f.pitch = 0;
@@ -1413,12 +1474,28 @@ export class Engine {
           } else updateBot(this.aiCtx, f, dt, lod);
           this.botFootsteps(f, dt);
         }
+      } else if (this.isSurvivalHostile(f)) {
+        // Survival is a one-life round for the player, so hostiles get exactly one life too:
+        // they are retired from the round and replaced by the next wave
+        if (!f.gone) {
+          f.gone = true;
+          if (f.view) f.view.group.visible = false;
+          this.scoreDirty = true;
+        }
       } else {
         f.respawnT -= dt;
         if (f.respawnT <= 0 && playing && !this.over) this.spawnFighter(f);
       }
       if (f.view) f.view.update(f, dt, this.time, cam.x, cam.y, cam.z, !hideNames);
     }
+    // retired fighters are dropped here (never during the loop above) and the next wave comes in
+    this.pruneGoneFighters();
+    if (playing && this.mode === 'survival' && !this.over && this.pendingHorde <= 0) {
+      // nobody left before the wave counter reached its quota would soft-lock the round
+      const aliveHostiles = this.fighters.some((f) => f.team === 1 && f.alive && !f.gone);
+      if (!aliveHostiles) this.pendingHorde = this.hordeSize();
+    }
+    if (playing) this.spawnPendingHorde();
     this.updateRockets(dt);
     this.updateLights(rdt);
     this.updateSun(dt);
@@ -1460,6 +1537,7 @@ export class Engine {
 
     // Enforce a minimum number of live AI opponents so small lobbies never feel empty.
     // Respawns are biased toward the player's vicinity (see pickSpawn) to avoid far-away unloads.
+    // Survival is excluded: its hostiles are a finite wave, not an endless trickle.
     if (playing && !this.over && this.mode !== 'duel') {
       let live = 0;
       for (const f of this.fighters) {
@@ -1468,7 +1546,7 @@ export class Engine {
       }
       this.liveAIT = live;
       let guard = 0;
-      while (live < this.minActiveAI && guard++ < this.minActiveAI) {
+      while (this.mode !== 'survival' && live < this.minActiveAI && guard++ < this.minActiveAI) {
         // Prefer respawning an existing dead enemy (cheapest), otherwise spawn a fresh bot
         let dead = this.fighters.find((f) => !f.isPlayer && !f.gone && !f.alive && this.aiCtx.isEnemy(this.player, f));
         const cap = this.coOp ? 120 : this.maxFighters();
@@ -1593,7 +1671,8 @@ export class Engine {
     if (this.mode === 'koth') {
       const occ = this.fighters.filter((f) => f.alive && this.inHill(f));
       this.hillAcc += dt;
-      if (this.hillAcc >= 1) {
+      let ticks = 0;
+      while (this.hillAcc >= 1 && ticks++ < 8) {
         this.hillAcc -= 1;
         // one point per second for whoever holds an uncontested hill; contested hills score nothing
         if (this.teamplay) {
@@ -1956,6 +2035,8 @@ export class Engine {
     this.aiCtx.mode = this.mode;
     // "cheats off" is represented by a missing cheats block, so an omitted value must clear them
     this.cheats = rules.cheats ? { ...rules.cheats } : { ...NO_CHEATS };
+    // `cheated` marks the match for the scoreboard; it mirrors the cheats that are actually active
+    // and is recomputed again when the next round starts (see startMatch)
     this.cheated = Object.values(this.cheats).some(Boolean);
   }
 
@@ -1987,7 +2068,7 @@ export class Engine {
   /** Keeps the round-to-round roster in sync after the host adds or removes players. */
   private syncRosterTarget() {
     this.botTarget = Math.max(1, this.fighters.filter((f) => !f.isPlayer && !f.gone).length);
-    this.minActiveAI = this.coOp ? 6 : Math.min(6, Math.max(1, this.botTarget));
+    this.minActiveAI = this.coOp ? 6 : Math.min(6, this.botTarget, Math.max(0, this.maxFighters() - 1));
   }
 
   addBot() {
@@ -2272,8 +2353,8 @@ export class Engine {
     const tgt = aa > 0 && this.aimT <= 0 ? (this.aimT = 1 / 30, this.findAimTarget()) : this.aimResult;
     if (aa <= 0) this.aimResult = null;
     this.aimTarget = tgt && tgt.f.spawnProt <= 0 ? tgt.f : null;
-    if (tgt) {
-      // slowdown ("friction") near targets
+    if (tgt && tgt.f.spawnProt <= 0) {
+      // slowdown ("friction") near targets — never toward an invulnerable, spawn-protected fighter
       const close = 1 - tgt.ang / tgt.cone;
       const fr = 1 - aa * 0.55 * (0.4 + 0.6 * close);
       dx *= fr;
@@ -2849,7 +2930,9 @@ export class Engine {
       if (f === owner && ignoreOwner) continue;
       if (this.teamMode && f.team === owner.team && f !== owner) continue;
       const b = f.body;
-      // slightly inflated body box so the rocket does not slip past at the edges
+      // rayAABB returns the entry distance (0 when the origin is already inside the box) or -1 on a
+      // miss, so `t < 0` only skips misses and a rocket spawning inside a body still detonates.
+      // The body box is slightly inflated so the rocket does not slip past at the edges.
       const t = rayAABB(ox, oy, oz, ux, uy, uz, b.x - 0.45, b.y - 0.15, b.z - 0.45, b.x + 0.45, b.y + b.h + 0.15, b.z + 0.45);
       if (t < 0 || t > bt) continue;
       bt = t;
@@ -2926,7 +3009,8 @@ export class Engine {
       const self = f === owner;
       const nx = (cx - x) / (d || 1), ny = (cy - y) / (d || 1), nz = (cz - z) / (d || 1);
       const kb = (self ? 19 : 12) * Math.pow(fall, 0.7);
-      if (f.spawnProt <= 0) {
+      // warmup and the post-match state have damage disabled, so they must not shove fighters either
+      if (f.spawnProt <= 0 && !this.warmup && !this.over) {
         b.vx += nx * kb;
         b.vz += nz * kb;
         b.vy += Math.max(ny, 0.4) * kb * 1.05;
@@ -2980,7 +3064,7 @@ export class Engine {
       return;
     }
     // fire exactly as many pellets as the weapon definition does (the shotgun has 9, not 6)
-    const pellets = Math.max(1, def.pellets);
+    const pellets = Number.isFinite(def.pellets) ? Math.max(1, Math.round(def.pellets)) : 1;
     for (let i = 0; i < pellets; i++) {
       let px = dx, py = dy, pz = dz;
       if (pellets > 1) {
@@ -3050,6 +3134,7 @@ export class Engine {
         ai.lastX = src.body.x;
         ai.lastY = src.body.y;
         ai.lastZ = src.body.z;
+        // `t` is the bot being hit and `ai` is its own state, so its own skill sets the reaction
         ai.reactT = Math.min(ai.reactT, this.botParams(t).react * 0.5);
         ai.path = [];
       }
@@ -3098,21 +3183,20 @@ export class Engine {
 
       if (this.mode === 'survival' && src.team === 0 && t.team === 1) {
         this.waveKills++;
-        const need = 5 + (this.wave - 1) * 2;
+        // A wave is finite now, so its kill quota can never exceed the horde (always leave one alive)
+        const need = Math.min(this.hordeSize() - 1, 5 + (this.wave - 1) * 2);
         if (this.waveKills >= need) {
           this.waveKills = 0;
           this.wave++;
+          // wave reward heals the living co-op team; it never resurrects anybody (allies come back
+          // through their own respawn timer, the player does not come back at all)
           for (const surv of this.fighters) {
-            if (surv.team === 0 && !surv.gone) {
-              if (surv.alive && !(surv.isPlayer && this.cheats.oneHp)) surv.hp = Math.min(100, surv.hp + 35);
-              else if (!surv.alive && !surv.isPlayer) this.spawnFighter(surv);
-            }
+            if (surv.team !== 0 || surv.gone || !surv.alive) continue;
+            if (surv.isPlayer && this.cheats.oneHp) continue;
+            surv.hp = Math.min(100, surv.hp + 35);
           }
-          if (this.fighters.filter((x) => x.team === 1).length < 18) {
-            const extra = this.makeBot(1, this.fighters.length);
-            this.fighters.push(extra);
-            this.spawnFighter(extra);
-          }
+          // waves must grow, not shrink: replenish the horde to this wave's size
+          this.pendingHorde = this.hordeSize();
           this.emit({ type: 'announce', text: `WAVE ${this.wave}`, sub: '+35 HP · hostile reinforcements incoming', tone: 'streak' });
           audio.play('streak');
         }

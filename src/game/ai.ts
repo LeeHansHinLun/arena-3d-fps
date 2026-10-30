@@ -11,6 +11,15 @@ export interface PickupLite {
   active: boolean;
 }
 
+export interface PadLite {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+}
+
 export interface AICtx {
   world: World;
   nav: Nav;
@@ -21,6 +30,10 @@ export interface AICtx {
   speedMul: number;
   insta: boolean;
   pickups: PickupLite[];
+  /** jump pads of the current level, so bots get launched exactly like the player */
+  pads: PadLite[];
+  /** the weapon's real fire interval (defs), so bots fire at the same rate as the player */
+  fireInterval(w: WeaponId): number;
   isEnemy(a: Fighter, b: Fighter): boolean;
   fire(f: Fighter, target: Fighter, weapon: WeaponId): void;
   mode?: string;
@@ -37,6 +50,14 @@ function angDiff(a: number, b: number) {
   if (d < -Math.PI) d += TAU;
   return d;
 }
+
+/** out-of-combat sprint multiplier, mirroring the player's ability to sprint while rotating */
+const BOT_SPRINT = 1.3;
+
+/** jump timing shared with the player controller (wall jump -> air jump -> ground jump) */
+const AIR_JUMP_V = 8.8 * 0.95;
+const WALL_JUMP_V = 9.4;
+const WALL_JUMP_PUSH = 8.2;
 
 const FIRE: Record<WeaponId, { interval: number; burstMin: number; burstVar: number }> = {
   rifle: { interval: 0.115, burstMin: 3, burstVar: 5 },
@@ -145,15 +166,28 @@ function newRoamGoal(c: AICtx, f: Fighter) {
       return;
     }
   }
-  if (f.hp < 60) {
-    const hp = live.filter((p) => p.type === 'health');
-    if (hp.length) {
-      let best = hp[0], bd = 1e9;
-      for (const p of hp) {
+  // pickups: health when hurt, armor whenever the vest is not full — same items the player goes for
+  const needHealth = f.hp < 60;
+  const needArmor = f.armor < 100;
+  if (needHealth || needArmor) {
+    const useful = live.filter((p) => (p.type === 'health' ? needHealth : needArmor));
+    // hurt bots always detour; healthy ones only sometimes bother with armor
+    if (useful.length && (needHealth || Math.random() < 0.5)) {
+      let best = useful[0], bd = 1e9;
+      for (const p of useful) {
         const d = Math.hypot(p.x - f.body.x, p.z - f.body.z);
         if (d < bd) { bd = d; best = p; }
       }
       ensurePath(c, f, best.x, best.y, best.z, true);
+      return;
+    }
+  }
+  // now and then route over a jump pad: the launch itself happens in the physics step below
+  if (c.pads.length && Math.random() < 0.16) {
+    const far = c.pads.filter((p) => Math.hypot(p.x - f.body.x, p.z - f.body.z) > 6);
+    if (far.length) {
+      const p = far[Math.floor(Math.random() * far.length)];
+      ensurePath(c, f, p.x, p.y, p.z, true);
       return;
     }
   }
@@ -189,6 +223,7 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
   ai.strafeT -= dt;
   ai.weaponT -= dt;
   ai.scanT -= dt;
+  ai.padCd -= dt;
   if (ai.burstPause > 0) ai.burstPause -= dt;
 
   if (ai.target && !ai.target.alive) {
@@ -209,7 +244,8 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
   const tgt = ai.target;
   const fight = !!tgt && ai.canSee;
   let wx = 0, wz = 0;
-  let speed = 6.3 * dp.speedMul * c.speedMul;
+  // roaming bots sprint like the player does out of combat; in a fight they strafe at walk speed
+  let speed = 6.3 * dp.speedMul * c.speedMul * (fight ? 1 : BOT_SPRINT);
   let wantJump = false;
   let desiredYaw = f.yaw;
   let yawRate = 6;
@@ -243,7 +279,9 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
     if (ai.reactT <= 0 && yawErr < 0.22 && ai.fireCd <= 0 && ai.burstPause <= 0 && dist < range) {
       c.fire(f, tgt, ai.weapon);
       const w = FIRE[ai.weapon];
-      ai.fireCd = w.interval * dp.fireMul * (0.9 + Math.random() * 0.3);
+      // use the real (mutator/instagib adjusted) weapon interval so bots fire the same gun we do
+      const interval = c.fireInterval(ai.weapon) || w.interval;
+      ai.fireCd = interval * dp.fireMul * (0.9 + Math.random() * 0.3);
       if (ai.burstLeft <= 0) ai.burstLeft = w.burstMin + Math.floor(Math.random() * w.burstVar);
       ai.burstLeft--;
       if (ai.burstLeft <= 0) {
@@ -293,9 +331,31 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
     ai.stuckT = 0;
   }
 
-  if (wantJump && b.onGround && ai.jumpCd <= 0) {
-    b.vy = 8.8;
-    ai.jumpCd = 0.8;
+  // same jump toolkit the player has: ground jump, one wall jump, one air jump
+  if (b.onGround) {
+    ai.airJumps = 1;
+    ai.wallJumps = 2;
+  }
+  if (wantJump && ai.jumpCd <= 0) {
+    if (b.onGround) {
+      b.vy = 8.8;
+      b.onGround = false;
+      ai.jumpCd = 0.8;
+    } else {
+      const w = { nx: 0, nz: 0 };
+      if (ai.wallJumps > 0 && c.world.probeWall(b, 0.18, w)) {
+        ai.wallJumps--;
+        ai.airJumps = 1;
+        b.vx = w.nx * WALL_JUMP_PUSH + b.vx * 0.35;
+        b.vz = w.nz * WALL_JUMP_PUSH + b.vz * 0.35;
+        b.vy = WALL_JUMP_V;
+        ai.jumpCd = 0.45;
+      } else if (ai.airJumps > 0) {
+        ai.airJumps--;
+        b.vy = AIR_JUMP_V;
+        ai.jumpCd = 0.45;
+      }
+    }
   }
 
   const len = Math.hypot(wx, wz);
@@ -313,6 +373,22 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
   b.vz += (dvz - b.vz) * k;
   b.vy -= c.gravity * dt;
   c.world.moveBody(b, dt);
+
+  // jump pads launch bots exactly like the player (same scaling with gravity)
+  if (ai.padCd <= 0) {
+    for (const pad of c.pads) {
+      if (Math.abs(b.x - pad.x) < 1.6 && Math.abs(b.z - pad.z) < 1.6 && b.y - pad.y < 0.6 && b.y - pad.y > -0.4 && b.vy <= 1) {
+        const kp = Math.sqrt(c.gravity / 24);
+        b.vx = pad.vx * kp;
+        b.vz = pad.vz * kp;
+        b.vy = pad.vy * kp;
+        b.onGround = false;
+        ai.padCd = 0.5;
+        ai.airJumps = 1;
+        break;
+      }
+    }
+  }
   f.moveSpeed = Math.hypot(b.vx, b.vz);
 
   const maxTurn = yawRate * dt;
