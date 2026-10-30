@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Engine, type EngineState, type FakeProfile, type GameEvent, type HudState, type MatchResult } from '@/game/engine';
 import { addScore, bumpProfile, loadScores } from '@/game/storage';
-import { NO_CHEATS, type Cheats, type ScoreEntry, type ServerInfo, type Settings } from '@/game/types';
+import type { LevelId } from '@/game/types';
+import type { ScoreEntry, ServerInfo, Settings } from '@/game/types';
+import type { LobbyConfig } from '@/game/lobby';
 import { audio } from '@/game/audio';
 import { Hud, type AnnounceItem, type ChatItem, type FeedItem } from './Hud';
 import { TouchControls } from './TouchControls';
@@ -11,7 +13,7 @@ import { HostOptions } from './HostOptions';
 import { Btn } from './kit';
 
 export function GameView({
-  server, bots, settings, onSettings, touch, onLeave, onServers, onLobby, onCheats, onMapChange, fakeProfiles, botCount, warmup,
+  server, bots, settings, onSettings, touch, onLeave, onServers, onLobby, config, onConfig, fakeProfiles, botCount, joining = true, warmup = false,
 }: {
   server: ServerInfo;
   bots: number;
@@ -21,10 +23,14 @@ export function GameView({
   onLeave: () => void;
   onServers: () => void;
   onLobby?: () => void;
-  onCheats?: (allowed: boolean, c: Cheats) => void;
-  onMapChange?: (level: ServerInfo['level'], gen?: ServerInfo['gen']) => void;
+  /** live lobby config — present when you are the host of this server */
+  config?: LobbyConfig;
+  onConfig?: (next: LobbyConfig, resolved?: LevelId) => void;
   fakeProfiles?: FakeProfile[];
   botCount?: number;
+  /** false when the server is starting a round we are already connected to (no "connecting" screen) */
+  joining?: boolean;
+  /** start the map in the pre-round warmup where everybody readies up */
   warmup?: boolean;
 }) {
   const mount = useRef<HTMLDivElement>(null);
@@ -34,7 +40,7 @@ export function GameView({
   const [engine, setEngine] = useState<Engine | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [phase, setPhase] = useState<EngineState>('intro');
-  const [connecting, setConnecting] = useState(true);
+  const [connecting, setConnecting] = useState(joining);
   const [hud, setHud] = useState<HudState | null>(null);
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [chat, setChat] = useState<ChatItem[]>([]);
@@ -48,8 +54,10 @@ export function GameView({
   const [top, setTop] = useState<ScoreEntry[]>([]);
   const [showSettings, setShowSettings] = useState(false);
   const [hostOpen, setHostOpen] = useState(false);
-  const [cheatsAllowed, setCheatsAllowed] = useState(!!server.rules.cheats);
   const [portrait, setPortrait] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
+  const [chatDraft, setChatDraft] = useState('');
+  const chatInput = useRef<HTMLInputElement>(null);
   const uid = useRef(0);
   const lastPhase = useRef<EngineState>('intro');
 
@@ -95,9 +103,9 @@ export function GameView({
         bots,
         botCount,
         fakeProfiles,
-        warmup,
         settings: settingsRef.current,
         touch,
+        warmup,
         handlers: {
           onHud: setHud,
           onEvent: handleEvent,
@@ -160,8 +168,52 @@ export function GameView({
     return () => window.removeEventListener('resize', check);
   }, []);
 
+  /* --------------------------------------------------------------- chat */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (chatOpen || phase !== 'playing' || board || showSettings || hostOpen) return;
+      if (e.key === 'Enter' || e.code === 'KeyT') {
+        e.preventDefault();
+        setChatOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [chatOpen, phase, board, showSettings, hostOpen]);
+
+  useEffect(() => {
+    engine?.setChatOpen(chatOpen);
+    if (chatOpen) {
+      const t = window.setTimeout(() => chatInput.current?.focus(), 10);
+      return () => clearTimeout(t);
+    }
+    if (phase === 'playing') engineRef.current?.input.releaseAll();
+    return undefined;
+  }, [chatOpen, engine, phase]);
+
+  const sendChat = () => {
+    engineRef.current?.sendChat(chatDraft);
+    setChatDraft('');
+    setChatOpen(false);
+    engineRef.current?.input.releaseAll();
+  };
+
+  // host edits (name, region, slot count…) should show up on the pause/result screens right away
+  const shownServer = useMemo<ServerInfo>(() => {
+    const lvl = engine?.server.level ?? server.level;
+    const gen = engine?.server.gen ?? server.gen;
+    return config
+      ? { ...server, level: lvl, gen, name: config.name, region: config.region, password: !!config.password.trim(), rules: { ...server.rules, maxPlayers: config.maxPlayers } }
+      : { ...server, level: lvl, gen };
+  }, [server, config, engine]);
+
   const deploy = useCallback(() => engineRef.current?.deploy(), []);
   const done = useCallback(() => setConnecting(false), []);
+
+  const applyConfig = (next: LobbyConfig, resolved?: LevelId) => {
+    onConfig?.(next, resolved);
+    engineRef.current?.patchServer({ name: next.name, region: next.region, password: !!next.password.trim() });
+  };
 
   if (failed) {
     return (
@@ -180,45 +232,70 @@ export function GameView({
   }
 
   return (
-    <div className="absolute inset-0 bg-black" style={{ cursor: phase === 'playing' ? 'none' : 'default' }}>
+    <div className="absolute inset-0 bg-black" style={{ cursor: phase === 'playing' && !chatOpen ? 'none' : 'default' }}>
       <div ref={mount} className="absolute inset-0" />
       {engine && phase !== 'intro' && (
         <Hud engine={engine} hud={hud} settings={settings} touch={touch} feed={feed} chat={chat} announce={announce} hit={hit} toast={toast} board={board} />
       )}
       {engine && touch && phase === 'playing' && (
-        <TouchControls input={engine.input} onPause={() => engine.pause()} onBoard={setBoard} />
+        <TouchControls input={engine.input} onPause={() => engine.pause()} onBoard={setBoard} onChat={() => setChatOpen(true)} />
+      )}
+      {!connecting && phase === 'intro' && <DeployOverlay server={shownServer} touch={touch} onDeploy={deploy} />}
+      {phase === 'playing' && !chatOpen && !touch && (
+        <div className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 font-display text-[10px] uppercase tracking-[0.3em] text-white/25">
+          Enter / T — chat
+        </div>
+      )}
+      {chatOpen && (
+        <div className="absolute inset-x-0 bottom-24 flex justify-center px-4">
+          <form
+            className="pointer-events-auto flex w-full max-w-xl gap-2"
+            onSubmit={(e) => { e.preventDefault(); sendChat(); }}
+          >
+            <input
+              ref={chatInput}
+              type="text"
+              value={chatDraft}
+              maxLength={140}
+              onChange={(e) => setChatDraft(e.target.value)}
+              onKeyDown={(e) => { if (e.key === 'Escape') { e.preventDefault(); setChatOpen(false); } }}
+              placeholder="Say something — Enter to send, Esc to cancel"
+              className="flex-1 cut-sm bg-black/80 px-3 py-2 text-sm text-white outline-none placeholder:text-white/35 shadow-[inset_0_0_0_1px_rgba(45,226,255,0.7)]"
+            />
+            <Btn size="sm" variant="cyan" onClick={sendChat}>Send</Btn>
+          </form>
+        </div>
       )}
       {touch && portrait && phase !== 'over' && (
         <div className="pointer-events-none absolute inset-x-0 top-1/3 z-30 flex justify-center">
           <div className="cut-sm bg-black/80 px-5 py-3 text-center font-display text-xs font-bold uppercase tracking-[0.2em] text-neon-yellow">⟳ Rotate your device to landscape</div>
         </div>
       )}
-      {!connecting && phase === 'intro' && <DeployOverlay server={server} touch={touch} onDeploy={deploy} />}
       {phase === 'paused' && (
         <PauseOverlay
-          server={server}
-          warmup={engine?.warmup}
+          server={shownServer}
+          warmup={!!hud?.warmup}
+          readySelf={!!hud?.readySelf}
+          readyCount={hud?.readyCount}
+          fighterCount={hud?.fighterCount}
+          onReady={() => engine?.toggleReady()}
           onResume={() => engine?.resume()}
-          onStartMatch={engine?.warmup ? () => engine.startMatchFromWarmup() : undefined}
-          onRestart={() => engine?.restart()}
+          onRestart={server.hosted ? () => engine?.restart() : undefined}
           onSettings={() => setShowSettings(true)}
           onLeave={onLobby ?? onLeave}
-          onHost={server.hosted && engine ? () => setHostOpen(true) : undefined}
+          onHost={server.hosted && engine && config ? () => setHostOpen(true) : undefined}
         />
       )}
       {phase === 'over' && showResult && result && (
-        <GameOverOverlay result={result} server={server} placed={placed} top={top} onRestart={() => engine?.restart()} onServers={onServers} onMenu={onLeave} onLobby={onLobby} />
+        <GameOverOverlay result={result} server={shownServer} placed={placed} top={top} onRestart={() => engine?.restart()} onServers={onServers} onMenu={onLeave} onLobby={onLobby} />
       )}
-      {hostOpen && engine && (
+      {hostOpen && engine && config && (
         <HostOptions
           engine={engine}
-          cheatsAllowed={cheatsAllowed}
-          onCheatsAllowed={(v) => {
-            setCheatsAllowed(v);
-            onCheats?.(v, v ? engine.cheats : { ...NO_CHEATS });
-          }}
-          onCheats={(c) => onCheats?.(cheatsAllowed, c)}
-          onMapChange={onMapChange}
+          config={config}
+          onConfig={applyConfig}
+          settings={settings}
+          onSettings={onSettings}
           onClose={() => setHostOpen(false)}
         />
       )}

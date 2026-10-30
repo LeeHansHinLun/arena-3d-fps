@@ -55,6 +55,8 @@ export class Fighter {
   shotsFired = 0;
   shotsHit = 0;
   ping = 40;
+  /** warmup ready-up flag (always false once the round is live) */
+  ready = false;
   spawnProt = 0;
   respawnT = 0;
   lastShotT = -99;

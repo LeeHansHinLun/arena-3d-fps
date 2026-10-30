@@ -62,6 +62,20 @@ const MODE_MOTD: Record<ModeId, string[]> = {
 };
 
 const rnd = (a: number, b: number) => a + Math.floor(Math.random() * (b - a + 1));
+
+/**
+ * Score, kills and deaths that actually agree with the mode, so joining a live server shows a
+ * scoreboard that looks like a match already in progress.
+ */
+function fragLine(mode: ModeId): { score: number; kills: number; deaths: number } {
+  if (mode === 'ctf' || mode === 'bounty') {
+    return { score: rnd(0, 4), kills: rnd(0, 20), deaths: rnd(0, 18) };
+  }
+  if (mode === 'koth') return { score: rnd(0, 75), kills: rnd(0, 24), deaths: rnd(0, 22) };
+  if (mode === 'survival') return { score: 0, kills: rnd(0, 40), deaths: rnd(0, 3) };
+  const kills = rnd(0, 18);
+  return { score: kills * 100, kills, deaths: Math.max(0, kills - rnd(-2, 6)) };
+}
 const pick = <T,>(a: T[]): T => a[Math.floor(Math.random() * a.length)];
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 
@@ -153,7 +167,7 @@ function makeServer(usedNames: Set<string>, usedServers: Set<string>, seed: numb
     const pr = pickPlayerRegion(region, Math.random);
     roster.push({
       name: genPlayerName(usedNames),
-      score: mode === 'ctf' || mode === 'bounty' ? rnd(0, 4) : mode === 'koth' ? rnd(0, 75) : rnd(0, 18) * 100,
+      ...fragLine(mode),
       ping: pingFor(region, pr),
       region: pr,
       skill: pick(['easy', 'normal', 'hard', 'insane']),
@@ -221,7 +235,7 @@ export class ServerSim {
     const mode = s.rules.mode;
     s.roster.push({
       name,
-      score: mode === 'ctf' || mode === 'bounty' ? rnd(0, 3) : mode === 'koth' ? rnd(0, 50) : rnd(0, 12) * 100,
+      ...fragLine(mode),
       ping: pingFor(s.region, pr),
       region: pr,
       skill: pick(['easy', 'normal', 'hard', 'insane']),

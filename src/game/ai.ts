@@ -197,6 +197,7 @@ export function updateBot(c: AICtx, f: Fighter, dt: number, lod = 0) {
     ai.path = [];
   }
   if (ai.scanT <= 0 && lod < 2) {
+    // during warmup the bots are just roaming — they look around lazily and mostly ignore you
     ai.scanT = (0.2 + Math.random() * 0.12) * (lod === 1 ? 2.5 : 1) * (c.warmup ? 2.2 : 1);
     if (!c.warmup || Math.random() < 0.25) scan(c, f);
     else {

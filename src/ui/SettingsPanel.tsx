@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { AIMBOT_TARGETS, type Settings } from '@/game/types';
+import type { Settings } from '@/game/types';
 import { defaultSettings } from '@/game/storage';
 import { audio } from '@/game/audio';
 import { Btn, Modal, Panel, Segmented, Slider, Toggle, sfx } from './kit';
@@ -29,6 +29,8 @@ const KEYS: [string, string][] = [
   ['R', 'Reload'],
   ['1-4 / Wheel / X', 'Switch weapon'],
   ['Tab', 'Scoreboard'],
+  ['T / Enter', 'Chat'],
+  ['V', 'Ready up (warmup)'],
   ['Arrow keys', 'Look (alternative)'],
   ['P / Esc', 'Pause'],
   ['R / Enter', 'Instant restart on game over'],
@@ -113,26 +115,6 @@ export function SettingsPanel({ settings, onChange, onClose, initialTab }: { set
             <div>
               <Slider label="Aim assist" value={settings.aimAssist} min={0} max={1} onChange={(v) => set('aimAssist', v)} format={(v) => (v < 0.01 ? 'Off' : pct(v))} color="#7dff6b" />
               <div className="-mt-1 mb-1 text-xs text-white/40">Slows your aim over enemies and gently pulls toward them while you move, look or fire. Works in every mode.</div>
-              <div className="py-1.5">
-                <div className="mb-1 text-sm font-semibold uppercase tracking-wider text-white/80">Aimbot target priority</div>
-                <div className="flex flex-wrap gap-1.5">
-                  {AIMBOT_TARGETS.map((t) => (
-                    <button
-                      key={t.v}
-                      type="button"
-                      title={t.desc}
-                      onClick={() => { sfx.ui(); set('aimbotTarget', t.v); }}
-                      className={cn(
-                        'cut-sm px-3 py-1.5 font-display text-[10px] font-bold uppercase tracking-widest transition',
-                        settings.aimbotTarget === t.v ? 'bg-neon-red text-white shadow-[0_0_14px_rgba(255,59,92,0.5)]' : 'bg-panel2 text-white/70 hover:text-white shadow-[inset_0_0_0_1px_rgba(120,100,220,0.45)]',
-                      )}
-                    >
-                      {t.label}
-                    </button>
-                  ))}
-                </div>
-                <div className="mt-1 text-xs text-white/40">{AIMBOT_TARGETS.find((t) => t.v === settings.aimbotTarget)?.desc}</div>
-              </div>
               <Slider label="Field of view" value={settings.fov} min={65} max={115} step={1} onChange={(v) => set('fov', v)} format={(v) => Math.round(v) + '°'} color="#ffe14d" />
               <Slider label="Mouse sensitivity" value={settings.sensitivity} min={0.2} max={3} onChange={(v) => set('sensitivity', v)} format={(v) => v.toFixed(2) + '×'} />
               <Slider label="Touch look sensitivity" value={settings.touchSensitivity} min={0.3} max={3} onChange={(v) => set('touchSensitivity', v)} format={(v) => v.toFixed(2) + '×'} color="#2de2ff" />

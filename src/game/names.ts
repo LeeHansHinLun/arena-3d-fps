@@ -72,9 +72,11 @@ export function pickOf<T>(a: T[]): T {
 }
 
 /* ------------------------------------------------------------------ chat */
-export type ChatKind = 'idle' | 'kill' | 'death' | 'frustrated' | 'winning' | 'losing' | 'join' | 'leave' | 'invite' | 'question' | 'strategy' | 'compliment' | 'insult' | 'gg' | 'rage' | 'calm' | 'welcome' | 'map' | 'weapon' | 'movement';
+export type ChatKind = 'ready' | 'notready' | 'idle' | 'kill' | 'death' | 'frustrated' | 'winning' | 'losing' | 'join' | 'leave' | 'invite' | 'question' | 'strategy' | 'compliment' | 'insult' | 'gg' | 'rage' | 'calm' | 'welcome' | 'map' | 'weapon' | 'movement';
 
 const CHAT: Record<ChatKind, string[]> = {
+  ready: ['rdy', 'ready', 'ready when you are', 'good to go', 'locked in', 'im ready', 'go go go', 'all set here', 'waiting on you', 'pistols out, rdy', 'loaded and ready'],
+  notready: ['sec, changing weapon', 'unready for a sec', 'brb', 'wait, one more thing', 'hold on', 'need to rebind a key', 'one sec, settings', 'give me 20s', 'changing loadout'],
   idle: ['anyone up for a 1v1?', 'this map is huge', 'rail is so strong on this map', 'who keeps camping the tower', 'gl hf everyone', 'brb getting water', 'nice server', 'how is your ping?', 'i love this soundtrack', 'first time on this map, it looks great', 'the jump pads are so fun', 'who wants to team up?', 'im warming up', 'that was a close one', 'anyone else lagging or just me', 'this lobby is chill', 'lets run it back after this', 'i need a better mouse', 'my aim is gone today', 'one more match then i sleep'],
   kill: ['gg', 'ez', 'nice try', 'too slow', 'sit down', 'outplayed', 'get rekt', 'bam', 'headshot, sorry', 'that was clean', 'you left yourself open', 'i saw that coming', 'skill issue', 'better luck next time', 'one tap', 'read you like a book', 'should have slid', 'check your corners', 'i was aiming there all along', 'clip it'],
   death: ['nice shot', 'ow', 'lag!', 'wtf', 'how', 'lucky', 'cheater?', 'rematch', 'ouch', 'gg', 'unreal', 'nt', 'i slipped', 'my bad', 'that was fast', 'you got me', 'i need to stop peeking', 'lag spike, i swear', 'ok that was clean', 'i will remember that'],

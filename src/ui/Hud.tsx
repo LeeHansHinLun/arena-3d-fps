@@ -73,7 +73,7 @@ function ModeStrip({ hud }: { hud: HudState }) {
   let text: string | null = null;
   let color = '#ffffff';
   if (hud.warmup) {
-    text = 'WARMUP · PRE-MATCH ROAM — DAMAGE & SCORING DISABLED (PAUSE [P] FOR HOST / START OPTIONS)';
+    text = `WARMUP · DAMAGE & SCORING OFF · ${hud.readyCount}/${hud.fighterCount} READY`;
     color = '#2de2ff';
   } else if (hud.mode === 'koth') {
     text = `HILL · ${hud.hillOwner || 'NEUTRAL'}${hud.hill ? ' · YOU ARE SCORING' : ''}`;
@@ -281,6 +281,41 @@ export function Hud({
           <ModeStrip hud={hud} />
         </div>
       )}
+      {/* warmup: ready-up card — the round starts once everybody is ready */}
+      {hud?.warmup && (
+        <div className="pointer-events-none absolute left-1/2 top-[96px] z-20 flex -translate-x-1/2 flex-col items-center">
+          <div className="cut-sm pointer-events-auto max-w-[86vw] bg-black/70 px-4 py-2 text-center shadow-[inset_0_0_0_1px_rgba(45,226,255,0.55)]">
+            <div className="font-display text-[9px] font-bold uppercase tracking-[0.35em] text-neon-cyan">Warmup</div>
+            <div className="font-display text-lg font-black uppercase leading-none tracking-wider text-white">
+              {hud.readyCount}/{hud.fighterCount} ready
+            </div>
+            {hud.startIn > 0 ? (
+              <div className="mt-1 font-display text-xl font-black uppercase tracking-[0.2em] text-neon-pink blink">
+                Round starts in {hud.startIn}
+              </div>
+            ) : (
+              <>
+                <button
+                  type="button"
+                  onClick={() => engine.toggleReady()}
+                  className={cn(
+                    'mt-1 px-5 py-1.5 font-display text-xs font-black uppercase tracking-[0.2em] text-white',
+                    hud.readySelf ? 'bg-neon-green/80' : 'bg-neon-pink shadow-[0_0_18px_rgba(255,45,149,0.6)]',
+                  )}
+                >
+                  {hud.readySelf ? '✓ Ready — cancel' : 'Ready up'}
+                </button>
+                {!touch && (
+                  <div className="mt-1 font-display text-[9px] font-bold uppercase tracking-[0.25em] text-white/45">
+                    or press [V] · [P] for menu
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* bounty direction arrow (points at the marked pilot) */}
       {hud?.alive && hud.mode === 'bounty' && hud.bountyRel !== null && (
         <div className="absolute left-1/2 top-[120px] -translate-x-1/2" style={{ transform: `translateX(-50%) rotate(${-hud.bountyRel}rad)` }}>

@@ -62,7 +62,7 @@ function TBtn({
   );
 }
 
-export function TouchControls({ input, onPause, onBoard }: { input: Input; onPause: () => void; onBoard: (show: boolean) => void }) {
+export function TouchControls({ input, onPause, onBoard, onChat }: { input: Input; onPause: () => void; onBoard: (show: boolean) => void; onChat?: () => void }) {
   const stick = useRef<{ id: number; ox: number; oy: number } | null>(null);
   const look = useRef<{ id: number; x: number; y: number } | null>(null);
   const [ui, setUi] = useState<{ ox: number; oy: number; dx: number; dy: number } | null>(null);
@@ -157,6 +157,20 @@ export function TouchControls({ input, onPause, onBoard }: { input: Input; onPau
       >
         II
       </button>
+      {onChat && (
+        <button
+          type="button"
+          aria-label="Chat"
+          className="pointer-events-auto absolute h-10 w-14 rounded-full bg-black/50 font-display text-[10px] font-black text-white shadow-[inset_0_0_0_1.5px_rgba(255,255,255,0.4)]"
+          style={{ left: 'calc(env(safe-area-inset-left, 0px) + 116px)', top: 'calc(env(safe-area-inset-top, 0px) + 106px)' }}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            onChat();
+          }}
+        >
+          CHAT
+        </button>
+      )}
       <button
         type="button"
         aria-label="Scoreboard"

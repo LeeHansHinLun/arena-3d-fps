@@ -3,13 +3,20 @@ import { audio } from '@/game/audio';
 import { detectTouch, loadSettings, saveSettings } from '@/game/storage';
 import { ServerSim } from '@/game/serverSim';
 import { randomPlayerName } from '@/game/names';
-import { pingFor } from '@/game/serverSim';
-import type { ServerInfo, Settings } from '@/game/types';
+import { LEVEL_IDS, type LevelId, type ServerInfo, type Settings } from '@/game/types';
+import {
+  isOpenLobby,
+  lobbyToServer,
+  newLobby,
+  opponentCount,
+  reconcileMembers,
+  type HostedLobby,
+  type LobbyConfig,
+} from '@/game/lobby';
 import { Menu } from '@/ui/Menu';
 import { ServerBrowser } from '@/ui/ServerBrowser';
 import { CustomGame, defaultLobby } from '@/ui/CustomGame';
-import { LobbyRoom, lobbyOpponents, lobbyToServer, newLobby, type HostedLobby } from '@/ui/LobbyRoom';
-import { LEVEL_IDS } from '@/game/types';
+import { LobbyRoom } from '@/ui/LobbyRoom';
 import { Leaderboard } from '@/ui/Leaderboard';
 import { SettingsPanel } from '@/ui/SettingsPanel';
 import { GameView } from '@/ui/GameView';
@@ -18,7 +25,6 @@ type Screen = 'menu' | 'servers' | 'custom' | 'lobby' | 'game';
 interface Session {
   server: ServerInfo;
   bots: number;
-  warmup?: boolean;
   key: number;
 }
 
@@ -53,6 +59,17 @@ export default function App() {
   const [lobby, setLobbyState] = useState<HostedLobby | null>(null);
   const [editing, setEditing] = useState(false);
   const setLobby = useCallback((f: (l: HostedLobby) => HostedLobby) => setLobbyState((l) => (l ? f(l) : l)), []);
+  const lobbyRef = useRef<HostedLobby | null>(null);
+  lobbyRef.current = lobby;
+
+  // the host entry in the lobby follows the pilot name you picked in Settings
+  useEffect(() => {
+    setLobbyState((l) =>
+      l && l.members.some((m) => m.host && m.name !== settings.name)
+        ? { ...l, members: l.members.map((m) => (m.host ? { ...m, name: settings.name } : m)) }
+        : l,
+    );
+  }, [settings.name]);
 
   useEffect(() => {
     saveSettings(settings);
@@ -103,8 +120,9 @@ export default function App() {
   }, []);
 
   const quick = useCallback(() => {
-    const pool = servers.filter((s) => s.players < s.rules.maxPlayers && s.ping < 200);
-    const list = pool.length ? pool : servers.filter((s) => s.players < s.rules.maxPlayers);
+    const pool = servers.filter((s) => s.players < s.rules.maxPlayers && s.ping < 200 && !s.password);
+    const list = pool.length ? pool : servers.filter((s) => s.players < s.rules.maxPlayers && !s.password);
+    if (!list.length) return;
     join(list[Math.floor(Math.random() * list.length)]);
   }, [servers, join]);
 
@@ -118,21 +136,29 @@ export default function App() {
     }, 700);
   }, [sim]);
 
-  const lobbyRef = useRef<HostedLobby | null>(null);
-  lobbyRef.current = lobby;
-  const startLobby = useCallback(() => {
+  /**
+   * Joining loads the map in warmup: you roam, ready up there and the round starts once you and
+   * the other players are ready. There is no separate "start match" step.
+   */
+  const joinMap = useCallback(() => {
     const l = lobbyRef.current;
     if (!l) return;
-    setSession({ server: lobbyToServer(l), bots: l.members.length - 1, warmup: false, key: ++keyRef.current });
+    setSession({ server: lobbyToServer(l), bots: opponentCount(l), key: ++keyRef.current });
     setScreen('game');
   }, []);
 
-  const startWarmup = useCallback(() => {
-    const l = lobbyRef.current;
-    if (!l) return;
-    const fakeCount = l.members.filter((m) => !m.bot && !m.host).length;
-    setSession({ server: lobbyToServer(l), bots: fakeCount, warmup: true, key: ++keyRef.current });
-    setScreen('game');
+  const updateConfig = useCallback((next: LobbyConfig, resolved?: LevelId) => {
+    setLobbyState((l) => {
+      if (!l) return l;
+      const regionChanged = l.config.region !== next.region;
+      return {
+        ...l,
+        config: next,
+        resolved: resolved ?? l.resolved,
+        // only re-ping when the server actually moved (otherwise pings would jitter on every edit)
+        members: regionChanged ? reconcileMembers(l.members, next) : l.members.slice(0, Math.max(1, next.maxPlayers)),
+      };
+    });
   }, []);
 
   const toLobby = useCallback(() => {
@@ -145,7 +171,10 @@ export default function App() {
     setSession(null);
     setScreen('menu');
   }, []);
-  const shownServers = useMemo(() => (lobby && lobby.config.isPublic ? [lobbyToServer(lobby), ...servers] : servers), [lobby, servers]);
+  const shownServers = useMemo(
+    () => (lobby && isOpenLobby(lobby.config) ? [lobbyToServer(lobby), ...servers] : servers),
+    [lobby, servers],
+  );
 
   const toServers = useCallback(() => {
     setSession(null);
@@ -194,18 +223,19 @@ export default function App() {
           key={editing ? 'edit' : 'new'}
           initial={editing && lobby ? lobby.config : defaultLobby(settings.name)}
           editing={editing}
-          onBack={() => setScreen(editing ? 'lobby' : 'menu')}
+          settings={settings}
+          onSettings={setSettings}
+          onBack={() => setScreen(editing && lobby ? 'lobby' : 'menu')}
           onSubmit={(c) => {
             if (editing && lobby) {
-              const keep = lobby.members.filter((m) => m.host || m.bot || m.invited || !c.password).slice(0, c.maxPlayers);
               setLobbyState({
                 ...lobby,
                 config: c,
+                // a new "random" pick is rolled when the map setting changes to random
                 resolved: c.map === 'random' ? LEVEL_IDS[Math.floor(Math.random() * LEVEL_IDS.length)] : lobby.resolved,
-                members: keep.map((m) => (m.host || m.bot ? m : { ...m, ping: pingFor(c.region, m.region ?? c.region) })),
+                members: reconcileMembers(lobby.members, c),
               });
-            }
-            else setLobbyState(newLobby(c, settings.name));
+            } else setLobbyState(newLobby(c, settings.name));
             setScreen('lobby');
           }}
         />
@@ -214,8 +244,7 @@ export default function App() {
         <LobbyRoom
           lobby={lobby}
           setLobby={setLobby}
-          onStart={startLobby}
-          onWarmup={startWarmup}
+          onJoin={joinMap}
           onEdit={() => { setEditing(true); setScreen('custom'); }}
           onClose={() => { setLobbyState(null); setScreen('menu'); }}
         />
@@ -225,31 +254,22 @@ export default function App() {
           key={session.key}
           server={session.server}
           bots={session.bots}
-          warmup={session.warmup}
           settings={settings}
           onSettings={setSettings}
           touch={touch}
-          fakeProfiles={session.server.hosted
-            ? (lobby?.members ?? []).filter((m) => !m.bot && !m.host).map((m) => ({ name: m.name, region: m.region }))
-            : session.server.roster.map((r) => ({ name: r.name, region: r.region, skill: r.skill, frustration: r.frustration }))}
-          botCount={session.server.hosted && lobby ? lobbyOpponents(lobby) : session.server.players}
           onLeave={leave}
           onServers={toServers}
           onLobby={session.server.hosted ? toLobby : undefined}
-          onCheats={session.server.hosted ? (allowed, c) => setLobby((l) => ({ ...l, config: { ...l.config, cheatsOn: allowed, cheats: c } })) : undefined}
-          onMapChange={
+          joining={!session.server.hosted}
+          warmup={!!session.server.hosted}
+          config={session.server.hosted ? lobby?.config : undefined}
+          onConfig={session.server.hosted ? updateConfig : undefined}
+          fakeProfiles={
             session.server.hosted
-              ? (lvl, gen) =>
-                  setLobby((l) => ({
-                    ...l,
-                    config: {
-                      ...l.config,
-                      map: lvl,
-                      gen: gen ? { ...l.config.gen, ...gen } : l.config.gen,
-                    },
-                  }))
-              : undefined
+              ? (lobby?.members ?? []).filter((m) => !m.host).map((m) => ({ name: m.name, region: m.region ?? lobby?.config.region }))
+              : session.server.roster.map((r) => ({ name: r.name, region: r.region, skill: r.skill, frustration: r.frustration, kills: r.kills, deaths: r.deaths, score: r.score }))
           }
+          botCount={session.server.hosted && lobby ? opponentCount(lobby) : session.server.players}
         />
       )}
       {scores && <Leaderboard onClose={() => setScores(false)} />}

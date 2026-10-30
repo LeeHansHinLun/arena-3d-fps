@@ -63,7 +63,13 @@ export interface HudState {
   leaderScore: number;
   bountyRel: number | null;
   bountyDist: number;
+  /** pre-round roam phase: damage and scoring are off while everybody readies up */
   warmup: boolean;
+  readySelf: boolean;
+  readyCount: number;
+  fighterCount: number;
+  /** seconds until the round starts, 0 when no countdown is running */
+  startIn: number;
 }
 
 export type GameEvent =
@@ -119,6 +125,10 @@ export interface FakeProfile {
   region?: string;
   skill?: Difficulty;
   frustration?: number;
+  /** scoreboard carried over from the server browser (players already in the match) */
+  kills?: number;
+  deaths?: number;
+  score?: number;
 }
 
 export interface EngineOptions {
@@ -130,6 +140,7 @@ export interface EngineOptions {
   handlers: EngineHandlers;
   fakeProfiles?: FakeProfile[];
   botCount?: number;
+  /** start in the pre-round warmup instead of straight into a live round */
   warmup?: boolean;
 }
 
@@ -227,7 +238,14 @@ export class Engine {
   private levelT = 0;
   private chatBudget = 0;
   private lowQuality = false;
+  /** true while the player is typing in the chat box; the game ignores keyboard input then */
+  chatOpen = false;
+  /** pre-round roam phase: everyone has to ready up before the round starts */
   warmup = false;
+  /** the player's own ready state during warmup */
+  readySelf = false;
+  private readyT = 0;
+  private startIn = -1;
   boardOpen = false;
   boardScroll = 0;
   minActiveAI = 6;
@@ -624,7 +642,7 @@ export class Engine {
     this.on(window, 'keydown', ((e: KeyboardEvent) => this.onKey(e, true)) as EventListener);
     this.on(window, 'keyup', ((e: KeyboardEvent) => this.onKey(e, false)) as EventListener);
     this.on(document, 'mousemove', ((e: MouseEvent) => {
-      if (this.state !== 'playing') return;
+      if (this.state !== 'playing' || this.chatOpen) return;
       if (!this.locked && !this.noLock) return;
       if (Math.abs(e.movementX) > 400 || Math.abs(e.movementY) > 400) return;
       this.input.mouseDX += e.movementX;
@@ -671,6 +689,8 @@ export class Engine {
   }
 
   private onKey(e: KeyboardEvent, down: boolean) {
+    // chat text box has focus: let the DOM handle every key
+    if (this.chatOpen) return;
     const code = e.code;
     const gameKeys = ['Space', 'Tab', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'];
     if ((this.state === 'playing' || this.state === 'over') && gameKeys.includes(code)) e.preventDefault();
@@ -697,6 +717,11 @@ export class Engine {
     if (e.repeat && code !== 'Space') return;
     if (code === 'KeyP' || (code === 'Escape' && this.noLock)) {
       this.pause();
+      return;
+    }
+    // V toggles your ready state while the map is warming up
+    if (down && code === 'KeyV' && this.warmup && this.state === 'playing') {
+      this.toggleReady();
       return;
     }
     this.input.keyDown(code);
@@ -752,6 +777,37 @@ export class Engine {
     this.requestPlay();
   }
 
+  /** Warmup only: ready yourself up (or back out) — the round starts when everybody is ready. */
+  setReady(ready: boolean) {
+    if (!this.warmup || this.over || this.readySelf === ready) return;
+    this.readySelf = ready;
+    this.player.ready = ready;
+    audio.play(ready ? 'beep' : 'uiBack');
+    this.emit({ type: 'chat', name: 'SERVER', text: ready ? `${this.settings.name || 'Player'} is ready` : `${this.settings.name || 'Player'} is not ready`, team: -1, system: true });
+    if (ready) {
+      const others = this.fighters.filter((f) => !f.isPlayer && !f.gone);
+      if (others.length) {
+        const who = pickOf(others);
+        this.later(() => this.emit({ type: 'chat', name: who.name, text: chatLine('ready', { region: who.region }), team: this.teamMode ? who.team : -1 }), 700 + Math.random() * 1400);
+      }
+    }
+  }
+
+  toggleReady() {
+    this.setReady(!this.readySelf);
+  }
+
+  /** Warmup → live round: everyone keeps their slot, the scoreboard starts from zero. */
+  private startRound() {
+    this.warmup = false;
+    this.aiCtx.warmup = false;
+    this.startIn = -1;
+    this.readySelf = false;
+    this.startMatch();
+    if (this.state !== 'playing' && (this.locked || this.touch || this.noLock)) this.setState('playing');
+    this.emit({ type: 'chat', name: 'SERVER', text: 'Round started — good luck, have fun', team: -1, system: true });
+  }
+
   pause() {
     if (this.state !== 'playing') return;
     this.input.releaseAll();
@@ -760,14 +816,6 @@ export class Engine {
     this.state = 'paused';
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
     this.setState('paused');
-  }
-
-  /** Transitions from pre-match warmup directly into a live match. */
-  startMatchFromWarmup() {
-    this.warmup = false;
-    this.aiCtx.warmup = false;
-    this.startMatch();
-    if (this.state !== 'playing') this.requestPlay();
   }
 
   /** Applies a new theme to sky, fog, sun and level materials in-place without respawning players. */
@@ -842,6 +890,12 @@ export class Engine {
   restart() {
     audio.init();
     this.startMatch();
+    // If we already own the pointer (or are unlocked/touch), go straight back in — asking for the
+    // lock again would emit no event and leave the round frozen behind a playing state.
+    if (this.locked || this.touch || this.noLock) {
+      this.setState('playing');
+      return;
+    }
     this.state = 'paused';
     this.requestPlay();
   }
@@ -891,7 +945,14 @@ export class Engine {
   }
 
   private startMatch() {
+    // The profiles describe a match already in progress, so only the very first round of this
+    // session inherits their scoreboard; later rounds start everybody from zero.
+    const seedScores = this.matchId === 0;
     this.matchId++;
+    // every (re)start begins with nobody ready, as in a real warmup
+    this.readySelf = false;
+    this.startIn = -1;
+    this.readyT = 0.9;
     this.t = 0;
     this.timeScale = 1;
     this.over = null;
@@ -926,7 +987,7 @@ export class Engine {
     const myTeam = this.coOp ? 0 : Math.random() < 0.5 ? 0 : 1;
     this.usedNames.add(s.name);
     const p = new Fighter(0, s.name || 'Player', this.teamMode ? myTeam : 0, true, this.teamMode ? TEAM_COLORS[myTeam] : 0xffffff, 'player');
-    p.ping = this.server.hosted ? 5 : this.server.ping;
+    p.ping = this.server.ping;
     this.player = p;
     this.fighters.push(p);
     const counts = [this.teamplay && myTeam === 0 ? 1 : 0, this.teamplay && myTeam === 1 ? 1 : 0];
@@ -940,18 +1001,28 @@ export class Engine {
       return team;
     };
     const target = this.mode === 'duel' ? 1 : this.botTarget;
-    for (const prof of this.fakeProfiles.slice(0, target)) this.fighters.push(this.makeFake(nextTeam(), prof.name, prof));
+    // Never conjure more opponents than the server actually has players for.
+    this.minActiveAI = this.coOp ? 6 : Math.min(6, Math.max(1, target));
+    for (const prof of this.fakeProfiles.slice(0, target)) {
+      this.fighters.push(this.makeFake(nextTeam(), prof.name, seedScores ? prof : { name: prof.name, region: prof.region, skill: prof.skill, frustration: prof.frustration }));
+    }
     let bi = 0;
-    if (!this.warmup) {
-      if (this.coOp) {
-        const hordeCount = Math.max(6, Math.min(16, 4 + this.wave * 2));
-        for (let i = 0; i < hordeCount; i++) this.fighters.push(this.makeBot(1, bi++));
-      } else {
-        while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
-      }
+    if (seedScores && this.teamplay) {
+      // a match in progress already has team points on the board
+      const t0 = this.fighters.filter((f) => f.team === 0).reduce((n, f) => n + f.kills, 0);
+      const t1 = this.fighters.filter((f) => f.team === 1).reduce((n, f) => n + f.kills, 0);
+      const lim = this.rules.scoreLimit;
+      const scale = lim > 0 ? Math.min(1, (lim - 1) / Math.max(1, t0, t1)) : 1;
+      this.teamScore = [Math.round(t0 * scale), Math.round(t1 * scale)];
     }
     this.wave = 1;
     this.waveKills = 0;
+    if (this.coOp) {
+      const hordeCount = Math.max(6, Math.min(16, 4 + this.wave * 2));
+      for (let i = 0; i < hordeCount; i++) this.fighters.push(this.makeBot(1, bi++));
+    } else {
+      while (this.fighters.length - 1 < target) this.fighters.push(this.makeBot(nextTeam(), bi++));
+    }
     this.bountyId = -1;
     this.aiCtx.bountyId = -1;
     this.hillAcc = 0;
@@ -967,7 +1038,7 @@ export class Engine {
     }
     this.flags.forEach((f) => this.scene.remove(f.mesh));
     this.flags = [];
-    if (!this.warmup) this.setupSpecialMode();
+    this.setupSpecialMode();
     this.aiCtx.fighters = this.fighters;
     for (const f of this.fighters) if (!f.isPlayer) this.spawnFighter(f, true);
     this.spawnFighter(p, true);
@@ -986,7 +1057,7 @@ export class Engine {
     pr.crouchToggle = false;
     pr.dashCd = 0;
     const modeName = this.warmup
-      ? 'PRE-MATCH WARMUP'
+      ? 'PRE-ROUND WARMUP'
       : this.rules.mode === 'survival'
         ? 'CO-OP SURVIVAL'
         : this.rules.mode === 'koth'
@@ -1003,7 +1074,7 @@ export class Engine {
     this.emit({
       type: 'announce',
       text: modeName,
-      sub: this.warmup ? 'Damage & scoring disabled · roam the arena' : this.server.name,
+      sub: this.warmup ? 'Damage & scoring off · press V to ready up' : this.server.name,
       tone: 'info',
     });
     this.emit({ type: 'chat', name: 'SERVER', text: `Connected to ${this.server.name} — ${this.server.motd}`, team: -1, system: true });
@@ -1039,6 +1110,13 @@ export class Engine {
     f.region = prof?.region ?? pickOf(['EU', 'NA', 'AS', 'SA', 'OC']);
     f.ping = pingFor(this.server.region, f.region);
     f.frustration = prof?.frustration ?? Math.random() * 0.2;
+    // Never seed a score that would already satisfy the win condition of the round.
+    const lim = this.rules.scoreLimit;
+    const cap = lim > 0 ? lim - 1 : Number.MAX_SAFE_INTEGER;
+    const pointsMode = this.mode === 'koth' || this.mode === 'bounty' || this.mode === 'ctf';
+    f.kills = Math.max(0, Math.min(cap, prof?.kills ?? 0));
+    f.deaths = Math.max(0, prof?.deaths ?? 0);
+    f.score = Math.max(0, Math.min(pointsMode ? cap : Number.MAX_SAFE_INTEGER, prof?.score ?? 0));
     f.ai = newAI();
     f.view = new BotView(color, name, color);
     this.scene.add(f.view.group);
@@ -1259,6 +1337,7 @@ export class Engine {
     this.updateCamera(rdt);
     this.updateViewmodel(rdt);
     this.updateVfx(rdt);
+    if (playing && this.warmup) this.updateWarmup(dt);
     if (playing) this.updateMatchEvents(dt);
     // HUD at 10 Hz, but throttle further (to ~4 Hz) when nothing scoreboard-relevant changed
     this.hudT -= rdt;
@@ -1502,8 +1581,80 @@ export class Engine {
     return out;
   }
 
+  /* ================================================================ warmup */
+  /**
+   * Pre-round warmup readiness. Simulated players behave like people in a real lobby: while the
+   * host is still fiddling with their loadout they ready up slowly and sometimes back out again;
+   * the moment the host is ready they pile in fast so the round can start.
+   */
+  private tickReadiness() {
+    const ais = this.fighters.filter((f) => !f.isPlayer && !f.gone);
+    if (!ais.length) return;
+    const unready = ais.filter((f) => !f.ready);
+    const flipped: Fighter[] = [];
+    if (this.readySelf) {
+      for (const f of unready) {
+        if (Math.random() < 0.7) {
+          f.ready = true;
+          flipped.push(f);
+        }
+      }
+      // never leave the host waiting on a stalled lobby: at least one player per tick
+      if (!flipped.length && unready.length && Math.random() < 0.9) {
+        const who = pickOf(unready);
+        who.ready = true;
+        flipped.push(who);
+      }
+    } else {
+      for (const f of unready) {
+        if (Math.random() < 0.09) {
+          f.ready = true;
+          flipped.push(f);
+        }
+      }
+      for (const f of ais) {
+        if (f.ready && Math.random() < 0.025) {
+          f.ready = false;
+          if (f.kind === 'fake' && Math.random() < 0.5) this.say(f, 'notready');
+        }
+      }
+    }
+    if (flipped.length && this.chatBudget <= 0) {
+      const who = pickOf(flipped);
+      if (who.kind === 'fake' && Math.random() < (this.readySelf ? 0.45 : 0.3)) this.say(who, 'ready');
+    }
+  }
+
+  private updateWarmup(dt: number) {
+    this.readyT -= dt;
+    if (this.readyT <= 0) {
+      this.readyT = 0.9;
+      this.tickReadiness();
+    }
+    const allReady = this.readySelf && this.fighters.every((f) => f.isPlayer || f.gone || f.ready);
+    if (!allReady) {
+      if (this.startIn >= 0) {
+        this.startIn = -1;
+        this.emit({ type: 'announce', text: 'READY-UP', sub: 'Waiting for everyone to ready up', tone: 'info' });
+      }
+      return;
+    }
+    if (this.startIn < 0) {
+      this.startIn = 3;
+      this.emit({ type: 'announce', text: 'ROUND STARTING', sub: 'Everyone is ready', tone: 'good' });
+      audio.play('beep');
+      return;
+    }
+    const before = Math.ceil(this.startIn);
+    this.startIn -= dt;
+    const after = Math.ceil(this.startIn);
+    if (after !== before && after > 0) audio.play('beep');
+    if (this.startIn <= 0) this.startRound();
+  }
+
   private updateMatchEvents(dt: number) {
     if (this.over) return;
+    // the match clock only runs during a live round, never during warmup
     if (!this.warmup && this.rules.timeLimit > 0 && this.rules.timeLimit + this.extraTime - this.t <= 0) {
       this.endMatch('time');
       return;
@@ -1649,6 +1800,54 @@ export class Engine {
   }
 
   /* ============================================================ host API */
+  /** Opens/closes the in-game chat. Game keys are ignored while it is open. */
+  setChatOpen(open: boolean) {
+    if (this.chatOpen === open) return;
+    this.chatOpen = open;
+    if (open) this.input.releaseAll();
+  }
+
+  /** Says something on the server; other players often answer. */
+  sendChat(text: string) {
+    const t = text.trim().slice(0, 140);
+    if (!t) return;
+    this.emit({ type: 'chat', name: this.settings.name || 'Player', text: t, team: this.teamMode ? this.player.team : -1 });
+    const others = this.fighters.filter((f) => !f.isPlayer && !f.gone);
+    if (!others.length || Math.random() > 0.7) return;
+    const who = pickOf(others);
+    const kind = pickOf<ChatKind>(['idle', 'gg', 'compliment', 'question', 'strategy', 'calm', 'welcome', 'insult', 'movement']);
+    this.later(() => {
+      this.emit({ type: 'chat', name: who.name, text: chatLine(kind, { region: who.region }), team: this.teamMode ? who.team : -1 });
+    }, 900 + Math.random() * 2200);
+  }
+
+  /** Folds new rules into the live engine. Takes effect on the next round. */
+  applyRules(rules: Rules) {
+    this.rules = rules;
+    this.server = { ...this.server, rules };
+    this.mode = rules.mode;
+    this.teamplay = isTeamMode(rules.mode);
+    this.insta = rules.mode === 'insta';
+    this.gravity = rules.mutator === 'lowgrav' ? 10.5 : 24;
+    this.speedMul = rules.mutator === 'turbo' ? 1.25 : 1;
+    this.diff = DIFF_PARAMS[rules.difficulty];
+    this.buildDefs();
+    this.aiCtx.diff = this.diff;
+    this.aiCtx.gravity = this.gravity;
+    this.aiCtx.speedMul = this.speedMul;
+    this.aiCtx.insta = this.insta;
+    this.aiCtx.mode = this.mode;
+    if (rules.cheats) {
+      this.cheats = { ...rules.cheats };
+      if (Object.values(this.cheats).some(Boolean)) this.cheated = true;
+    }
+  }
+
+  /** Keeps the engine's view of the server (name, region, motd…) in sync with host edits. */
+  patchServer(patch: Partial<ServerInfo>) {
+    this.server = { ...this.server, ...patch };
+  }
+
   setCheats(c: Cheats) {
     this.cheats = { ...c };
     if (Object.values(c).some(Boolean)) this.cheated = true;
@@ -1664,6 +1863,12 @@ export class Engine {
     this.aiCtx.diff = this.diff;
     this.emit({ type: 'chat', name: 'SERVER', text: `Bot skill set to ${d}`, team: -1, system: true });
   }
+  /** Keeps the round-to-round roster in sync after the host adds or removes players. */
+  private syncRosterTarget() {
+    this.botTarget = Math.max(1, this.fighters.filter((f) => !f.isPlayer && !f.gone).length);
+    this.minActiveAI = this.coOp ? 6 : Math.min(6, Math.max(1, this.botTarget));
+  }
+
   addBot() {
     if (this.fighters.length >= 120) return;
     let team = 0;
@@ -1677,6 +1882,7 @@ export class Engine {
     this.scoreDirty = true;
     this.aiCtx.fighters = this.fighters;
     this.spawnFighter(f);
+    this.syncRosterTarget();
     this.emit({ type: 'chat', name: 'SERVER', text: `${f.name} joined the game`, team: -1, system: true });
   }
   kick(id: number) {
@@ -1691,6 +1897,7 @@ export class Engine {
     this.scoreDirty = true;
     this.usedNames.delete(f.name);
     this.aiCtx.fighters = this.fighters;
+    this.syncRosterTarget();
     this.emit({ type: 'chat', name: 'SERVER', text: `${f.name} was kicked by the host`, team: -1, system: true });
   }
   addTime(sec: number) {
@@ -1797,7 +2004,10 @@ export class Engine {
     const def = this.curDef();
     const cam = this.camera.position;
     const ox = cam.x, oy = cam.y, oz = cam.z;
-    let bestAng = 1e9;
+    const priority = this.settings.aimbotTarget;
+    // anything further from the crosshair than this counts as off-screen for the aimbot priorities
+    const cone = Math.max(0.14, Math.atan(Math.tan((this.settings.fov * Math.PI) / 360)) * 0.95);
+    let bestScore = -1e9;
     let bestYaw = p.yaw;
     let bestPitch = p.pitch;
     let found = false;
@@ -1851,8 +2061,31 @@ export class Engine {
         const yaw = Math.atan2(-dx, -dz);
         const pitch = Math.atan2(dy, dh);
         const ang = Math.hypot(angDiff(p.yaw, yaw), pitch - p.pitch);
-        if (ang < bestAng) {
-          bestAng = ang;
+        const onScreen = ang <= cone;
+        if (priority === 'screen' && !onScreen) break;
+        // Target priorities are what the "Aimbot target priority" option in the cheats menu picks.
+        const hp = f.hp + f.armor;
+        let score: number;
+        switch (priority) {
+          case 'closest':
+            score = -d0;
+            break;
+          case 'health':
+            score = -hp * 10 - ang;
+            break;
+          case 'screen':
+            score = -ang;
+            break;
+          case 'screen-first':
+            score = (onScreen ? 100 : 0) - ang;
+            break;
+          default:
+            // smart: weighs visibility, crosshair proximity, distance and remaining health
+            score = (onScreen ? 60 : 0) - ang * 40 - d0 * 0.6 - hp * 0.25;
+            break;
+        }
+        if (score > bestScore) {
+          bestScore = score;
           bestYaw = yaw;
           bestPitch = pitch;
           found = true;
@@ -3081,8 +3314,8 @@ export class Engine {
       cur: W.cur,
       dash: clamp(1 - this.P.dashCd / (this.rules.mutator === 'turbo' ? 1.2 : 1.7), 0, 1),
       speed: hv,
-      // During warmup the match clock is frozen (timer disabled until the match actually starts)
-      timeLeft: this.warmup ? (this.rules.timeLimit > 0 ? this.rules.timeLimit + this.extraTime : 0) : this.rules.timeLimit > 0 ? Math.max(0, this.rules.timeLimit + this.extraTime - this.t) : 0,
+      // during warmup the match clock is frozen until the round actually starts
+      timeLeft: this.warmup ? this.rules.timeLimit + this.extraTime : this.rules.timeLimit > 0 ? Math.max(0, this.rules.timeLimit + this.extraTime - this.t) : 0,
       scoreLimit: this.rules.scoreLimit,
       mode: this.rules.mode,
       myKills: p.kills,
@@ -3118,6 +3351,10 @@ export class Engine {
       bountyRel,
       bountyDist,
       warmup: this.warmup,
+      readySelf: this.readySelf,
+      readyCount: this.fighters.filter((f) => !f.gone && f.ready).length,
+      fighterCount: this.fighters.filter((f) => !f.gone).length,
+      startIn: this.startIn > 0 ? Math.ceil(this.startIn) : 0,
     };
     return h;
   }

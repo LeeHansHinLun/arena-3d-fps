@@ -1,53 +1,28 @@
 import { useEffect, useMemo, useState } from 'react';
 import type { LevelData } from '@/game/levels';
-import { DIFFS, LEVEL_IDS, MODES, MODE_ORDER, MUTATORS, NO_CHEATS, REGIONS, SIZE_INFO, fmtTime, type BuiltinLevelId, type Cheats, type Difficulty, type MapSize, type ModeId, type Mutator } from '@/game/types';
+import { DIFFS, LEVEL_IDS, MODES, MODE_ORDER, MUTATORS, REGIONS, SIZE_INFO, fmtTime, type BuiltinLevelId, type Difficulty, type MapSize, type ModeId, type Mutator, type Settings } from '@/game/types';
 import { PROC_THEMES, getLevel } from '@/game/levels';
+import { defaultLobby, MAX_PLAYERS_MAX, MAX_PLAYERS_MIN, type LobbyConfig } from '@/game/lobby';
 import { Btn, Chip, MapPreview, Segmented, Toggle, sfx } from './kit';
 import { CheatsEditor } from './Cheats';
 import { MapDetails } from './MapDetails';
 import { cn } from '@/utils/cn';
 
-export interface LobbyConfig {
-  name: string;
-  password: string;
-  isPublic: boolean;
-  region: string;
-  map: BuiltinLevelId | 'random' | 'procedural';
-  gen: { seed: number; size: MapSize; w: number; d: number; theme: string; style: string };
-  mode: ModeId;
-  scoreLimit: number;
-  timeLimit: number;
-  difficulty: Difficulty;
-  mutator: Mutator;
-  maxPlayers: number;
-  fill: number; // players to fill with (incl. you)
-  cheatsOn: boolean;
-  cheats: Cheats;
-}
-
-export function defaultLobby(name: string): LobbyConfig {
-  return {
-    name: `${name || 'Player'}'s Lobby`,
-    password: '',
-    isPublic: true,
-    region: 'EU',
-    map: 'random',
-    gen: { seed: Math.floor(Math.random() * 99999) + 1, size: 'medium', w: 112, d: 112, theme: 'auto', style: 'auto' },
-    mode: 'ffa',
-    scoreLimit: 20,
-    timeLimit: 300,
-    difficulty: 'normal',
-    mutator: 'none',
-    maxPlayers: 12,
-    fill: 8,
-    cheatsOn: false,
-    cheats: { ...NO_CHEATS },
-  };
-}
+export { defaultLobby };
+export type { LobbyConfig };
 
 const field = 'w-full cut-sm bg-panel2 px-3 py-2 font-display text-sm text-white outline-none shadow-[inset_0_0_0_1px_rgba(120,100,220,0.6)] focus:shadow-[inset_0_0_0_1px_#2de2ff]';
 
-export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: LobbyConfig; editing?: boolean; onSubmit: (c: LobbyConfig) => void; onBack: () => void }) {
+export function CustomGame({
+  initial, editing, onSubmit, onBack, settings, onSettings,
+}: {
+  initial: LobbyConfig;
+  editing?: boolean;
+  onSubmit: (c: LobbyConfig) => void;
+  onBack: () => void;
+  settings: Settings;
+  onSettings: (s: Settings) => void;
+}) {
   const [c, setC] = useState<LobbyConfig>(initial);
   const [details, setDetails] = useState<LevelData | null>(null);
   const [presets, setPresets] = useState(false);
@@ -75,12 +50,8 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
   const shownStyle = isProc ? c.gen.style : (activeLevel.styleName ?? 'Mixed').toLowerCase();
 
   const setMaxPlayers = (raw: number) => {
-    const v = Math.max(2, Math.min(120, Math.round(raw || 2)));
-    setC((o) => ({ ...o, maxPlayers: v, fill: Math.min(o.fill, v) }));
-  };
-  const setFill = (raw: number) => {
-    const v = Math.max(1, Math.min(c.maxPlayers, Math.round(raw || 1)));
-    set('fill', v);
+    const v = Math.max(MAX_PLAYERS_MIN, Math.min(MAX_PLAYERS_MAX, Math.round(raw || MAX_PLAYERS_MIN)));
+    setC((o) => ({ ...o, maxPlayers: v }));
   };
 
   const section = (n: string, t: string) => <div className="mb-2 mt-1 font-display text-[11px] font-bold uppercase tracking-[0.25em] text-white/60">{n} · {t}</div>;
@@ -113,7 +84,12 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
                   <input type="text" maxLength={16} value={c.password} placeholder="none" onChange={(e) => set('password', e.target.value)} className={cn(field, 'placeholder:text-white/25')} />
                 </label>
               </div>
-              <Toggle label="Public lobby" value={c.isPublic} onChange={(v) => set('isPublic', v)} hint="Listed in the server browser so others can join" />
+              <Toggle
+                label="Public lobby"
+                value={c.isPublic}
+                onChange={(v) => set('isPublic', v)}
+                hint={c.isPublic ? 'Listed in the server browser — anyone can join' : 'Not listed anywhere — nobody can join unless you add them'}
+              />
               <Segmented label="Region" value={c.region} onChange={(v) => set('region', v)} options={REGIONS.map((r) => ({ v: r, label: r }))} />
 
               <div className="py-1.5">
@@ -123,8 +99,8 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
                     <span className="text-[10px] uppercase tracking-wider text-white/40">Custom:</span>
                     <input
                       type="number"
-                      min={2}
-                      max={120}
+                      min={MAX_PLAYERS_MIN}
+                      max={MAX_PLAYERS_MAX}
                       aria-label="Custom max players"
                       value={c.maxPlayers}
                       onChange={(e) => setMaxPlayers(parseInt(e.target.value, 10))}
@@ -149,40 +125,6 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
                 </div>
               </div>
 
-              <div className="py-1.5">
-                <div className="mb-1 flex items-center justify-between text-sm font-semibold uppercase tracking-wider text-white/80">
-                  <span>Expected players</span>
-                  <div className="flex items-center gap-1.5">
-                    <span className="text-[10px] uppercase tracking-wider text-white/40">Custom:</span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={c.maxPlayers}
-                      aria-label="Custom expected players"
-                      value={c.fill}
-                      onChange={(e) => setFill(parseInt(e.target.value, 10))}
-                      className="w-16 cut-sm bg-panel2 px-2 py-1 text-right font-display text-xs font-bold text-neon-cyan outline-none shadow-[inset_0_0_0_1px_rgba(120,100,220,0.6)] focus:shadow-[inset_0_0_0_1px_#2de2ff]"
-                    />
-                  </div>
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {[2, 4, 6, 8, 12, 16, 24, 32, 48, 64]
-                    .filter((n) => n <= c.maxPlayers)
-                    .map((n) => (
-                      <button
-                        key={n}
-                        type="button"
-                        onClick={() => { sfx.ui(); setFill(n); }}
-                        className={cn(
-                          'cut-sm px-3 py-1.5 font-display text-[11px] font-bold uppercase tracking-widest transition',
-                          c.fill === n ? 'bg-neon-pink text-white shadow-[0_0_14px_rgba(255,45,149,0.5)]' : 'bg-panel2 text-white/70 hover:text-white shadow-[inset_0_0_0_1px_rgba(120,100,220,0.45)]',
-                        )}
-                      >
-                        {n}
-                      </button>
-                    ))}
-                </div>
-              </div>
             </div>
 
             <div>
@@ -392,7 +334,7 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
                 {c.cheatsOn && <Chip color="#ff3b5c">sv_cheats 1</Chip>}
               </div>
               <Toggle label="Enable cheats (sv_cheats)" value={c.cheatsOn} onChange={(v) => set('cheatsOn', v)} hint="Unlocks cheat options here and in the in-game host menu" />
-              {c.cheatsOn && <CheatsEditor value={c.cheats} onChange={(v) => set('cheats', v)} />}
+              {c.cheatsOn && <CheatsEditor value={c.cheats} onChange={(v) => set('cheats', v)} settings={settings} onSettings={onSettings} />}
             </div>
           </div>
         </div>
@@ -400,7 +342,7 @@ export function CustomGame({ initial, editing, onSubmit, onBack }: { initial: Lo
 
       <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center bg-gradient-to-t from-ink via-ink/90 to-transparent p-4 pt-10">
         <Btn size="lg" variant="primary" onClick={() => onSubmit(c)} className="pointer-events-auto" disabled={!c.name.trim()}>
-          {editing ? 'Apply settings ›' : 'Create lobby ›'}
+          {editing ? 'Apply settings ›' : 'Create server & join ›'}
         </Btn>
       </div>
 

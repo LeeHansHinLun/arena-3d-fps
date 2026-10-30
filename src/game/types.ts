@@ -48,7 +48,7 @@ export const AIMBOT_TARGETS: { v: AimbotTarget; label: string; desc: string }[] 
 export const CHEAT_INFO: { k: keyof Cheats; name: string; desc: string }[] = [
   { k: 'god', name: 'God mode', desc: 'You take no damage' },
   { k: 'oneHp', name: '1 HP lock', desc: 'Locks your health at 1 HP and prevents death' },
-  { k: 'aimbot', name: 'Aimbot', desc: 'Snaps to a target with movement prediction when firing (configure targeting in Settings → Controls)' },
+  { k: 'aimbot', name: 'Aimbot', desc: 'Snaps to a target with movement prediction when firing (target priority is set below)' },
   { k: 'infiniteAmmo', name: 'Infinite ammo', desc: 'Never reload again' },
   { k: 'rapidFire', name: 'Rapid fire', desc: '3× fire rate, every gun is automatic' },
   { k: 'oneShot', name: 'One-shot kills', desc: 'Any hit is lethal' },
@@ -80,6 +80,8 @@ export interface Rules {
 export interface RosterEntry {
   name: string;
   score: number;
+  kills?: number;
+  deaths?: number;
   ping: number;
   region: string;
   skill?: Difficulty;

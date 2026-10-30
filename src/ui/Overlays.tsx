@@ -92,10 +92,10 @@ export function DeployOverlay({ server, touch, onDeploy }: { server: ServerInfo;
       </div>
       <div className="flex flex-col items-center gap-4">
         <div className="cut-sm bg-neon-pink px-8 py-4 font-display text-xl font-black uppercase tracking-[0.3em] text-white shadow-[0_0_40px_rgba(255,45,149,0.7)] animate-pulse sm:text-3xl">
-          {touch ? 'Tap to deploy' : 'Click to deploy'}
+          {touch ? 'Tap to join' : 'Click to join'}
         </div>
         <div className="max-w-xl text-xs uppercase tracking-[0.2em] text-white/60">
-          {touch ? 'Left thumb: move · Right thumb: look · Slide, dash, peek and double-jump with the buttons' : 'WASD move · Shift sprint · Space jump (tap again mid-air!) · C slide · F dash · Q/E peek · R reload · 1-4 weapons'}
+          {touch ? 'Left thumb: move · Right thumb: look · Slide, dash, peek and double-jump with the buttons' : 'WASD move · Shift sprint · Space jump (tap again mid-air!) · C slide · F dash · Q/E peek · R reload · 1-4 weapons · V ready · T chat'}
         </div>
       </div>
     </div>
@@ -106,18 +106,26 @@ export function DeployOverlay({ server, touch, onDeploy }: { server: ServerInfo;
 export function PauseOverlay({
   server,
   warmup,
+  readySelf,
+  readyCount,
+  fighterCount,
+  onReady,
   onResume,
-  onStartMatch,
   onRestart,
   onSettings,
   onLeave,
   onHost,
 }: {
   server: ServerInfo;
+  /** the round has not started yet: you are in the warmup ready-up phase */
   warmup?: boolean;
+  readySelf?: boolean;
+  readyCount?: number;
+  fighterCount?: number;
+  onReady?: () => void;
   onResume: () => void;
-  onStartMatch?: () => void;
-  onRestart: () => void;
+  /** host only — a player cannot restart someone else's round */
+  onRestart?: () => void;
   onSettings: () => void;
   onLeave: () => void;
   onHost?: () => void;
@@ -132,17 +140,26 @@ export function PauseOverlay({
   };
   return (
     <div className="absolute inset-0 z-20 flex items-center justify-center bg-ink/75 p-4 backdrop-blur-sm fade-in">
-      <Panel title="Paused" className="w-full max-w-sm">
+      <Panel title={warmup ? 'Warmup' : 'Paused'} className="w-full max-w-sm">
         <div className="p-5">
           <div className="mb-4 text-center">
             <div className="truncate font-display text-sm font-extrabold uppercase tracking-wider">{server.name}</div>
             <div className="mt-1 text-xs text-white/50">{server.ip}:{server.port} · {levelLabel(server)}</div>
+            {warmup && (
+              <div className="mt-2 font-display text-[10px] font-bold uppercase tracking-[0.25em] text-neon-cyan">
+                {readyCount ?? 0}/{fighterCount ?? 0} ready · damage off
+              </div>
+            )}
           </div>
           <div className="flex flex-col gap-2.5">
+            {warmup && onReady && (
+              <Btn size="lg" variant={readySelf ? 'primary' : 'cyan'} onClick={onReady}>
+                {readySelf ? '✓ Ready — tap to cancel' : 'Ready up'}
+              </Btn>
+            )}
             <Btn size="lg" onClick={onResume}>Resume</Btn>
-            {warmup && onStartMatch && <Btn variant="primary" onClick={onStartMatch}>▶ Start match</Btn>}
             {onHost && <Btn variant="cyan" onClick={onHost}>★ Host options</Btn>}
-            <Btn variant="yellow" onClick={onRestart}>{warmup ? 'Respawn warmup' : 'Restart match'}</Btn>
+            {onRestart && <Btn variant="yellow" onClick={onRestart}>Restart round</Btn>}
             <div className="grid grid-cols-2 gap-2.5">
               <Btn variant="ghost" onClick={onSettings}>Settings</Btn>
               <Btn variant="ghost" onClick={fs}>Fullscreen</Btn>
