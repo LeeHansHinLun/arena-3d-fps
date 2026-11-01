@@ -7,6 +7,7 @@ export const MAP_NICE: Record<LevelId, string> = {
   skyline: 'Skyline District',
   colosseum: 'The Colosseum',
   procedural: 'Procedural',
+  showcase: 'Graphics Showcase',
 };
 
 /** Human label for a server's map, e.g. "Procedural · Large". */

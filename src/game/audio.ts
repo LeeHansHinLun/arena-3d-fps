@@ -64,7 +64,12 @@ class AudioEngine {
   }
 
   setVolumes(master: number, sfx: number, music: number) {
-    this.vol = { master, sfx, music };
+    // applySettings forwards volumes on every settings change (graphics
+    // sliders included); skip the gain-ramp scheduling when nothing moved.
+    if (this.vol.master === master && this.vol.sfx === sfx && this.vol.music === music) return;
+    this.vol.master = master;
+    this.vol.sfx = sfx;
+    this.vol.music = music;
     this.applyVolumes();
   }
 

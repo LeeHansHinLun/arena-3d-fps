@@ -37,6 +37,7 @@ const LEVEL_TAG: Record<LevelId, string[]> = {
   skyline: ['Skyline', 'Skyline District', 'Rooftops'],
   colosseum: ['Colosseum', 'The Pit', 'Amphitheater'],
   procedural: ['Procedural', 'Generated Sector', 'Dynamic Map'],
+  showcase: ['Graphics Showcase', 'Benchmark Range'],
 };
 
 const MODE_TAG: Record<ModeId, string[]> = {

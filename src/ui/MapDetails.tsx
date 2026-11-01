@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { computeBoxMetrics, type Box, type LevelData } from '@/game/levels';
 import { buildLevelObjects, renderLevelMap } from '@/game/levelMesh';
 import { Btn, Chip, Modal, Panel, sfx } from './kit';
@@ -46,6 +46,8 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
   const [hover, setHover] = useState<Hover | null>(null);
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [showGrid, setShowGrid] = useState(true);
+  /** bumped when the async WebGPURenderer init finishes so the draw effect re-runs */
+  const [threeReadyTick, setThreeReadyTick] = useState(0);
   const dragRef = useRef<{ startX: number; startY: number; panX: number; panZ: number; moved: boolean } | null>(null);
 
   const scale = width / Math.max(level.w, level.d);
@@ -198,7 +200,8 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
 
   // 3D Top-Down orthographic view (never clips when zooming)
   const threeRef = useRef<{
-    renderer: THREE.WebGLRenderer;
+    renderer: THREE.WebGPURenderer;
+    ready: boolean;
     scene: THREE.Scene;
     cam: THREE.OrthographicCamera;
     selMesh: THREE.Mesh;
@@ -210,7 +213,8 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
   useEffect(() => {
     if (viewMode !== '3d' || !mount3d.current) return;
     const container = mount3d.current;
-    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    let cancelled = false;
+    const renderer = new THREE.WebGPURenderer({ antialias: true, powerPreference: 'high-performance' });
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
     renderer.toneMappingExposure = 1.2;
     const scene = new THREE.Scene();
@@ -295,17 +299,29 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
 
     container.innerHTML = '';
     container.appendChild(renderer.domElement);
-    threeRef.current = { renderer, scene, cam, selMesh, hovMesh, gridHelper, updateShadowCam };
+    const entry = { renderer, ready: false, scene, cam, selMesh, hovMesh, gridHelper, updateShadowCam };
+    threeRef.current = entry;
+    void renderer
+      .init()
+      .then(() => {
+        if (cancelled) {
+          void renderer.dispose();
+          return;
+        }
+        entry.ready = true;
+        setThreeReadyTick((n) => n + 1);
+      })
+      .catch((err) => console.error('[arena] MapDetails renderer init failed', err));
 
     return () => {
+      cancelled = true;
       threeRef.current = null;
       levelObjs.dispose();
       selGeo.dispose();
       selMat.dispose();
       hovGeo.dispose();
       hovMat.dispose();
-      renderer.dispose();
-      renderer.forceContextLoss();
+      void renderer.dispose();
       renderer.domElement.remove();
     };
   }, [viewMode, level]);
@@ -313,7 +329,7 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
   // Render 3D Top-Down frame whenever camera/selection/hover/size changes
   useEffect(() => {
     const t = threeRef.current;
-    if (!t || viewMode !== '3d') return;
+    if (!t || !t.ready || viewMode !== '3d') return;
     const dpr = Math.min(2, window.devicePixelRatio || 1);
     t.renderer.setPixelRatio(dpr);
     t.renderer.setSize(dispW, dispH, false);
@@ -366,7 +382,7 @@ export function MapDetails({ level, onClose }: { level: LevelData; onClose: () =
     }
 
     t.renderer.render(t.scene, t.cam);
-  }, [viewMode, dispW, dispH, zoom, pan, level, selectedBox, selectedMetrics, hover, hoverMetrics, showGrid]);
+  }, [viewMode, dispW, dispH, zoom, pan, level, selectedBox, selectedMetrics, hover, hoverMetrics, showGrid, threeReadyTick]);
 
   const clampPan = (nx: number, nz: number, z = zoom) => {
     const maxX = Math.max(0, (level.w / 2) * (1 - 1 / z));

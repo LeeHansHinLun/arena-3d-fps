@@ -119,6 +119,27 @@ export default function App() {
     setScreen('game');
   }, []);
 
+  /** Graphics showcase / benchmark range (Settings → Graphics → "Open test level"). */
+  const joinShowcase = useCallback(() => {
+    const server: ServerInfo = {
+      id: 'showcase-local',
+      name: 'PRISM — Graphics Showcase',
+      ip: '127.0.0.1',
+      port: 7777,
+      region: 'LOCAL',
+      level: 'showcase',
+      rules: { mode: 'ffa', scoreLimit: 50, timeLimit: 0, difficulty: 'normal', mutator: 'none', maxPlayers: 16 },
+      players: 9,
+      ping: 1,
+      motd: 'Engine test range: lighting, reflections, volumetrics + benchmark loop.',
+      roster: [],
+      hosted: false,
+      alwaysOnline: true,
+    };
+    setSettingsTab(null);
+    join(server, 9);
+  }, [join]);
+
   const quick = useCallback(() => {
     const pool = servers.filter((s) => s.players < s.rules.maxPlayers && s.ping < 200 && !s.password);
     const list = pool.length ? pool : servers.filter((s) => s.players < s.rules.maxPlayers && !s.password);
@@ -273,7 +294,7 @@ export default function App() {
         />
       )}
       {scores && <Leaderboard onClose={() => setScores(false)} />}
-      {settingsTab && screen !== 'game' && <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setSettingsTab(null)} initialTab={settingsTab} />}
+      {settingsTab && screen !== 'game' && <SettingsPanel settings={settings} onChange={setSettings} onClose={() => setSettingsTab(null)} initialTab={settingsTab} onShowcase={joinShowcase} />}
     </div>
   );
 }

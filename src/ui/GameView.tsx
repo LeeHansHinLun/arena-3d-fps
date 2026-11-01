@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Engine, type EngineState, type FakeProfile, type GameEvent, type HudState, type MatchResult } from '@/game/engine';
+import { Engine, type BenchResult, type EngineState, type FakeProfile, type GameEvent, type HudState, type MatchResult } from '@/game/engine';
 import { addScore, bumpProfile, loadScores } from '@/game/storage';
 import type { LevelId } from '@/game/types';
 import type { ScoreEntry, ServerInfo, Settings } from '@/game/types';
@@ -8,7 +8,7 @@ import { audio } from '@/game/audio';
 import { Hud, type AnnounceItem, type ChatItem, type FeedItem } from './Hud';
 import { TouchControls } from './TouchControls';
 import { ConnectingOverlay, DeployOverlay, GameOverOverlay, PauseOverlay } from './Overlays';
-import { SettingsPanel } from './SettingsPanel';
+import { SettingsPanel, applyPreset } from './SettingsPanel';
 import { HostOptions } from './HostOptions';
 import { Btn } from './kit';
 
@@ -57,6 +57,9 @@ export function GameView({
   const [portrait, setPortrait] = useState(false);
   const [chatOpen, setChatOpen] = useState(false);
   const [chatDraft, setChatDraft] = useState('');
+  const [benchRes, setBenchRes] = useState<BenchResult | null>(null);
+  const [benchCopied, setBenchCopied] = useState(false);
+  const isShowcase = server.level === 'showcase';
   const chatInput = useRef<HTMLInputElement>(null);
   const uid = useRef(0);
   const lastPhase = useRef<EngineState>('intro');
@@ -109,6 +112,7 @@ export function GameView({
         handlers: {
           onHud: setHud,
           onEvent: handleEvent,
+          onBenchmark: (r) => setBenchRes(r),
           onState: (s) => {
             if (lastPhase.current === 'over' && s !== 'over') {
               setFeed([]);
@@ -240,7 +244,78 @@ export function GameView({
       {engine && touch && phase === 'playing' && (
         <TouchControls input={engine.input} onPause={() => engine.pause()} onBoard={setBoard} onChat={() => setChatOpen(true)} />
       )}
-      {!connecting && phase === 'intro' && <DeployOverlay server={shownServer} touch={touch} onDeploy={deploy} />}
+      {!connecting && phase === 'intro' && (
+        <DeployOverlay
+          server={shownServer}
+          touch={touch}
+          onDeploy={deploy}
+          onBenchmark={isShowcase ? () => { setBenchRes(null); engineRef.current?.startBenchmark(30); } : undefined}
+        />
+      )}
+      {!connecting && phase === 'intro' && isShowcase && (
+        <div className="absolute bottom-4 right-4 z-30 flex flex-col items-end gap-1.5">
+          <Btn size="sm" variant="yellow" onClick={() => onSettings(applyPreset(settingsRef.current, 'Reference'))}>Apply Reference preset</Btn>
+          <div className="text-[10px] uppercase tracking-[0.2em] text-white/45">Max fidelity — then run the benchmark</div>
+        </div>
+      )}
+      {hud && hud.bench >= 0 && (
+        <div className="absolute inset-x-0 top-4 z-30 flex justify-center px-4">
+          <div className="w-full max-w-lg cut-sm bg-black/75 px-4 py-3 text-center shadow-[inset_0_0_0_1px_rgba(255,225,77,0.55)]">
+            <div className="font-display text-[11px] font-bold uppercase tracking-[0.3em] text-neon-yellow">
+              Benchmark running · {hud.benchFps} FPS
+            </div>
+            <div className="mt-2 h-2 w-full bg-white/10">
+              <div className="h-full bg-neon-yellow transition-[width] duration-200" style={{ width: Math.round(hud.bench * 100) + '%' }} />
+            </div>
+            <div className="mt-2 flex items-center justify-between text-[10px] uppercase tracking-[0.2em] text-white/50">
+              <span>{Math.round(hud.bench * 100)}% · flying the showcase loop</span>
+              <button type="button" className="text-neon-red hover:text-white" onClick={() => engineRef.current?.pause()}>Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {benchRes && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-ink/70 p-4 backdrop-blur-sm fade-in">
+          <div className="cut glass neon-border w-full max-w-md p-5 pop-in">
+            <div className="font-display text-base font-black uppercase tracking-[0.25em] text-neon-yellow">Benchmark results</div>
+            <div className="mt-1 text-xs text-white/50">{benchRes.resolution} · {benchRes.frames} frames over {benchRes.duration}s · peak {benchRes.drawCalls} draw calls · {(benchRes.triangles / 1000).toFixed(0)}k tris</div>
+            <div className="mt-4 grid grid-cols-3 gap-2 text-center">
+              {[
+                ['Avg FPS', benchRes.avgFps, '#7dff6b'],
+                ['1% low', benchRes.low1Fps, '#ffe14d'],
+                ['0.1% low', benchRes.low01Fps, '#ff9a3c'],
+                ['Min FPS', benchRes.minFps, '#ff3b5c'],
+                ['Max FPS', benchRes.maxFps, '#2de2ff'],
+                ['Frame time', benchRes.avgMs + 'ms', '#a26bff'],
+              ].map(([label, value, color]) => (
+                <div key={String(label)} className="cut-sm bg-panel2/70 px-2 py-2.5 shadow-[inset_0_0_0_1px_rgba(120,100,220,0.4)]">
+                  <div className="font-display text-xl font-black" style={{ color: String(color) }}>{value}</div>
+                  <div className="mt-0.5 text-[9px] font-bold uppercase tracking-[0.2em] text-white/45">{label}</div>
+                </div>
+              ))}
+            </div>
+            <div className="mt-3 text-sm text-white/75">{benchRes.verdict}</div>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <Btn size="sm" variant="yellow" onClick={() => { setBenchRes(null); engineRef.current?.startBenchmark(30); }}>Run again</Btn>
+              <Btn
+                size="sm"
+                variant="ghost"
+                onClick={() => {
+                  const text = `NEON RIOT benchmark (PRISM showcase) — avg ${benchRes.avgFps} FPS, 1% low ${benchRes.low1Fps}, 0.1% low ${benchRes.low01Fps}, min ${benchRes.minFps}, max ${benchRes.maxFps} @ ${benchRes.resolution} (${benchRes.avgMs}ms avg frame, ${benchRes.frames} frames). ${benchRes.verdict}`;
+                  try {
+                    void navigator.clipboard?.writeText(text).then(() => setBenchCopied(true));
+                  } catch {
+                    /* clipboard unavailable */
+                  }
+                }}
+              >
+                {benchCopied ? 'Copied ✓' : 'Copy results'}
+              </Btn>
+              <Btn size="sm" variant="cyan" onClick={() => setBenchRes(null)}>Close</Btn>
+            </div>
+          </div>
+        </div>
+      )}
       {phase === 'playing' && !chatOpen && !touch && (
         <div className="pointer-events-none absolute bottom-2 left-1/2 -translate-x-1/2 font-display text-[10px] uppercase tracking-[0.3em] text-white/25">
           Enter / T — chat
@@ -284,6 +359,7 @@ export function GameView({
           onSettings={() => setShowSettings(true)}
           onLeave={onLobby ?? onLeave}
           onHost={server.hosted && engine && config ? () => setHostOpen(true) : undefined}
+          onBenchmark={isShowcase ? () => { setBenchRes(null); engineRef.current?.startBenchmark(30); } : undefined}
         />
       )}
       {phase === 'over' && showResult && result && (

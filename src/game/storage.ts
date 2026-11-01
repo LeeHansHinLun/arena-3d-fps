@@ -1,4 +1,4 @@
-import type { ScoreEntry, Settings } from './types';
+import { COLORED_LIGHT_PRESET_VALUES, coloredLightPresetSettings, type ScoreEntry, type Settings } from './types';
 
 const SKEY = 'neonriot.settings.v1';
 const HKEY = 'neonriot.scores.v1';
@@ -34,6 +34,24 @@ export function defaultSettings(touch = detectTouch()): Settings {
     adaptive: true,
     particles: touch ? 0 : 2,
     antialias: !touch,
+    aaMode: touch ? 'off' : 'native',
+    ssaaScale: 1.5,
+    aniso: touch ? 1 : 2,
+    // Everything below is opt-in (Reference preset / manual toggles) so the default
+    // experience keeps running smoothly on lower-end devices.
+    ao: 0,
+    ssr: 0,
+    dof: 0,
+    dofAutoFocus: true,
+    ...coloredLightPresetSettings(touch ? 0 : 1),
+    volumetric: touch ? 0 : 1,
+    envReflections: false,
+    bloomQuality: 1,
+    raysQuality: 1,
+    // A modest shared amount for the (extra-subdued) sun and local lamps/neon.
+    flare: touch ? 0 : 0.22,
+    sharpen: 0,
+    colorGrade: 0,
     viewDistance: touch ? 1 : 2,
     screenShake: 0.8,
     headBob: true,
@@ -41,8 +59,8 @@ export function defaultSettings(touch = detectTouch()): Settings {
     crosshair: '#2de2ff',
     aimAssist: touch ? 0.6 : 0,
     post: !touch,
-    bloom: 0.7,
-    godRays: touch ? 0 : 0.8,
+    bloom: 0.62,
+    godRays: touch ? 0 : 0.55,
     dynamicLights: true,
     shadowSoftness: 1,
     dynamicSun: false,
@@ -50,7 +68,7 @@ export function defaultSettings(touch = detectTouch()): Settings {
     chromatic: true,
     filmGrain: false,
     exposure: 1.15,
-    atmosphere: 0.5,
+    atmosphere: 0.42,
     movement: 'classic',
     peek: true,
     aimbotTarget: 'smart',
@@ -61,7 +79,19 @@ export function loadSettings(): Settings {
   const d = defaultSettings();
   try {
     const raw = localStorage.getItem(SKEY);
-    if (raw) return { ...d, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<Settings>;
+      const merged = { ...d, ...parsed };
+      // Older saves only stored the coloured-light tier (Off–High). Expand that
+      // tier into the new max-distance / visible-limit slider fields instead of
+      // silently dropping those users back to the defaults above.
+      const legacyColored = COLORED_LIGHT_PRESET_VALUES[merged.coloredLights] ?? COLORED_LIGHT_PRESET_VALUES[1];
+      if (!('coloredLightLimit' in parsed)) merged.coloredLightLimit = legacyColored.limit;
+      if (!('coloredLightDistance' in parsed)) merged.coloredLightDistance = legacyColored.distance;
+      // settings saved before AA modes existed only have the `antialias` boolean
+      if (!('aaMode' in parsed)) merged.aaMode = merged.antialias ? 'native' : 'off';
+      return merged;
+    }
   } catch {
     /* ignore */
   }

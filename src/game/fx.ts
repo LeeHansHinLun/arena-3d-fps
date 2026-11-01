@@ -1,4 +1,80 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+
+/**
+ * Floating ambient dust motes that drift in a box around the camera (wrapping at the edges).
+ * One Points draw call; density follows the particles quality setting.
+ */
+export class AmbientDust {
+  points: THREE.Points;
+  private pos: Float32Array;
+  private seed: Float32Array;
+  private n: number;
+  private active: number;
+  private box = 46;
+
+  constructor(scene: THREE.Scene, count = 380) {
+    this.n = count;
+    this.active = count;
+    this.pos = new Float32Array(count * 3);
+    this.seed = new Float32Array(count);
+    for (let i = 0; i < count; i++) {
+      this.pos[i * 3] = (Math.random() - 0.5) * this.box;
+      this.pos[i * 3 + 1] = Math.random() * 14;
+      this.pos[i * 3 + 2] = (Math.random() - 0.5) * this.box;
+      this.seed[i] = Math.random() * 100;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
+    const m = new THREE.PointsMaterial({ color: 0xcdd8ff, size: 0.055, sizeAttenuation: true, transparent: true, opacity: 0.45, blending: THREE.AdditiveBlending, depthWrite: false, toneMapped: false });
+    this.points = new THREE.Points(g, m);
+    this.points.frustumCulled = false;
+    this.points.renderOrder = 4;
+    scene.add(this.points);
+  }
+
+  setDensity(f: number) {
+    this.points.visible = f > 0.01;
+    this.active = Math.floor(this.n * Math.min(1, Math.max(0, f)));
+    this.points.geometry.setDrawRange(0, this.active);
+  }
+
+  setTint(hex: number) {
+    (this.points.material as THREE.PointsMaterial).color.setHex(hex);
+  }
+
+  update(dt: number, cam: THREE.Vector3, t: number) {
+    if (!this.points.visible) return;
+    const half = this.box / 2;
+    const p = this.pos;
+    for (let i = 0; i < this.active; i++) {
+      const s = this.seed[i];
+      const j = i * 3;
+      p[j] += Math.sin(t * 0.22 + s) * 0.12 * dt + dt * 0.18;
+      p[j + 1] += (Math.sin(t * 0.35 + s * 1.7) * 0.1 - 0.05) * dt;
+      p[j + 2] += Math.cos(t * 0.19 + s * 0.9) * 0.12 * dt;
+      // Wrap around the camera so the field of motes is endless. One modulo
+      // step (not a while loop) also recovers motes that were inactive while
+      // the camera teleported more than one box width.
+      const dx = p[j] - cam.x;
+      if (dx > half || dx < -half) p[j] -= Math.round(dx / this.box) * this.box;
+      const dz = p[j + 2] - cam.z;
+      if (dz > half || dz < -half) p[j + 2] -= Math.round(dz / this.box) * this.box;
+      // Respawn height from the particle's own seed — no Math.random() here.
+      if (p[j + 1] < 0.15) p[j + 1] = 0.15 + (s - Math.floor(s)) * 2;
+      if (p[j + 1] > cam.y + 16) p[j + 1] = Math.max(0.3, cam.y - 2);
+    }
+    // Only the active prefix is drawn (and only it moved): upload just that.
+    const attr = this.points.geometry.attributes.position as THREE.BufferAttribute;
+    attr.clearUpdateRanges();
+    if (this.active > 0) attr.addUpdateRange(0, this.active * 3);
+    attr.needsUpdate = true;
+  }
+
+  dispose() {
+    this.points.geometry.dispose();
+    (this.points.material as THREE.Material).dispose();
+  }
+}
 
 /** Pooled instanced cubes: sparks, debris, dust, gibs. One draw call. */
 export class Particles {

@@ -1,7 +1,20 @@
 export type ModeId = 'ffa' | 'tdm' | 'insta' | 'ctf' | 'koth' | 'survival' | 'bounty' | 'duel';
 export type Difficulty = 'easy' | 'normal' | 'hard' | 'insane' | 'auto';
 export type Mutator = 'none' | 'lowgrav' | 'turbo';
-export type LevelId = 'plaza' | 'yard' | 'skyline' | 'colosseum' | 'procedural';
+export type LevelId = 'plaza' | 'yard' | 'skyline' | 'colosseum' | 'procedural' | 'showcase';
+/**
+ * Anti-aliasing technique.
+ * - `native`: hardware MSAA (render-target samples in the post pipeline, canvas MSAA without it)
+ * - `fxaa` / `smaa`: post-process AA (official three.js passes, run after tone mapping)
+ * - `taa`: temporal AA with camera jitter + history reprojection
+ * - `ssaa`: super-sampling — the scene is rendered at `ssaaScale`× resolution and resolved down
+ */
+export type AaMode = 'off' | 'native' | 'fxaa' | 'smaa' | 'taa' | 'ssaa';
+
+/** Resolves the AA mode, migrating the legacy boolean (`antialias`) from older saved settings. */
+export function aaModeOf(s: Settings): AaMode {
+  return s.aaMode ?? (s.antialias ? 'native' : 'off');
+}
 export type MapSize = 'small' | 'medium' | 'large' | 'huge';
 export type BuiltinLevelId = Exclude<LevelId, 'procedural'>;
 export type WeaponId = 'rifle' | 'shotgun' | 'rail' | 'rocket';
@@ -119,11 +132,47 @@ export interface Settings {
   invertY: boolean;
   toggleCrouch: boolean;
   autoSprint: boolean;
-  shadows: 0 | 1 | 2 | 3;
+  shadows: 0 | 1 | 2 | 3 | 4;
   renderScale: number;
   adaptive: boolean;
   particles: 0 | 1 | 2;
+  /** legacy: kept in sync with `aaMode === 'native'` so older saved settings keep working */
   antialias: boolean;
+  aaMode: AaMode;
+  /** super-sampling factor used when aaMode is 'ssaa' (1.25–2) */
+  ssaaScale: number;
+  /** anisotropic texture filtering: 0=1×, 1=4×, 2=8×, 3=16× */
+  aniso: 0 | 1 | 2 | 3;
+  /** ground-truth ambient occlusion (GTAO): 0=off, 1=balanced (half res), 2=quality (full res) */
+  ao: 0 | 1 | 2;
+  /** screen-space reflections: 0=off, 1=balanced, 2=quality */
+  ssr: 0 | 1 | 2;
+  /** depth of field strength, 0=off */
+  dof: number;
+  dofAutoFocus: boolean;
+  /**
+   * Coloured-light preset selector: 0=Off, 1=Low, 2=Medium, 3=High,
+   * 4=Custom. Selecting 0–3 writes the two slider fields below; moving a
+   * slider switches this to Custom (unless it lands exactly on a preset).
+   */
+  coloredLights: 0 | 1 | 2 | 3 | 4;
+  /** max simultaneous coloured spotlights: 0=off, -1=unlimited (WebGPU batch; also uncaps local flare) */
+  coloredLightLimit: number;
+  /** max camera distance (metres) at which a coloured fixture/segment activates: -1=unlimited */
+  coloredLightDistance: number;
+  /** volumetric light cones/shafts: 0=off, 1=on, 2=high intensity */
+  volumetric: 0 | 1 | 2;
+  /** image-based lighting: PMREM environment generated from the map theme */
+  envReflections: boolean;
+  bloomQuality: 0 | 1 | 2;
+  /** god-ray march quality: 0=fast, 1=balanced, 2=quality */
+  raysQuality: 0 | 1 | 2;
+  /** analytic sun lens flare strength, 0=off (occluded by real geometry) */
+  flare: number;
+  /** post sharpening (counteracts TAA/FXAA softness), 0=off */
+  sharpen: number;
+  /** colour grade amount: 0 = the classic look, higher = more saturation/contrast */
+  colorGrade: number;
   viewDistance: 0 | 1 | 2;
   screenShake: number;
   headBob: boolean;
@@ -144,6 +193,47 @@ export interface Settings {
   peek: boolean;
   showFps: boolean;
   aimbotTarget: AimbotTarget;
+}
+
+/** Sentinel used by the coloured-light sliders/settings for an uncapped value. JSON-safe, unlike Infinity. */
+export const COLORED_LIGHT_UNLIMITED = -1;
+
+/**
+ * Slider values written by the coloured-light presets. Distance is measured
+ * from the camera to the nearest point of a fixture / grouped neon segment.
+ */
+export const COLORED_LIGHT_PRESET_VALUES: readonly { limit: number; distance: number }[] = [
+  { limit: 0, distance: 45 },
+  { limit: 4, distance: 45 },
+  { limit: 8, distance: 90 },
+  { limit: COLORED_LIGHT_UNLIMITED, distance: COLORED_LIGHT_UNLIMITED },
+];
+
+export function coloredLightPresetSettings(preset: number): Pick<Settings, 'coloredLights' | 'coloredLightLimit' | 'coloredLightDistance'> {
+  const p = COLORED_LIGHT_PRESET_VALUES[preset] ?? COLORED_LIGHT_PRESET_VALUES[1];
+  return {
+    coloredLights: (preset >= 0 && preset <= 3 ? preset : 1) as Settings['coloredLights'],
+    coloredLightLimit: p.limit,
+    coloredLightDistance: p.distance,
+  };
+}
+
+/**
+ * Resolves the requested coloured-light cap. Older settings objects may not
+ * carry the slider fields; those fall back to the old Off–High tier mapping.
+ * A negative result means unlimited.
+ */
+export function coloredLightLimitOf(s: Settings): number {
+  const raw = s.coloredLightLimit;
+  if (typeof raw === 'number' && !Number.isNaN(raw)) return raw;
+  return (COLORED_LIGHT_PRESET_VALUES[s.coloredLights] ?? COLORED_LIGHT_PRESET_VALUES[1]).limit;
+}
+
+/** Resolves the requested coloured-light activation distance; negative means unlimited. */
+export function coloredLightDistanceOf(s: Settings): number {
+  const raw = s.coloredLightDistance;
+  if (typeof raw === 'number' && !Number.isNaN(raw)) return raw;
+  return (COLORED_LIGHT_PRESET_VALUES[s.coloredLights] ?? COLORED_LIGHT_PRESET_VALUES[1]).distance;
 }
 
 export interface ScoreEntry {

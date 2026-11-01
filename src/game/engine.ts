@@ -1,20 +1,38 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
 import { audio, type Sfx } from './audio';
 import { Input } from './input';
-import { getLevel, mulberry32, type LevelData, type Theme } from './levels';
+import { deriveEmissiveSources, getLevel, mulberry32, type LevelData, type LightFixture, type Theme } from './levels';
 import { buildLevelObjects, renderLevelMap, type LevelMap, type LevelObjects } from './levelMesh';
 import { World, rayAABB, raySphere, type RayHit } from './world';
 import { Nav } from './nav';
-import { Blasts, Decals, Particles, Tracers } from './fx';
+import { AmbientDust, Blasts, Decals, Particles, Tracers } from './fx';
 import { WEAPONS, WEAPON_ORDER, buildViewModel, type ViewModel, type WeaponDef } from './weapons';
 import { BotView, Fighter, newAI } from './fighter';
 import { updateBot, type AICtx, type PickupLite } from './ai';
-import { DIFF_PARAMS, NO_CHEATS, isTeamMode, type Cheats, type Difficulty, type LevelId, type ModeId, type Rules, type ServerInfo, type Settings, type WeaponId } from './types';
+import { DIFF_PARAMS, NO_CHEATS, aaModeOf, coloredLightDistanceOf, coloredLightLimitOf, isTeamMode, type Cheats, type Difficulty, type LevelId, type ModeId, type Rules, type ServerInfo, type Settings, type WeaponId } from './types';
 import { pingFor, userPingTo } from './serverSim';
-import { PostPipeline } from './post';
+import { PostPipeline, type FlareSourceParam } from './post';
+import { DynamicLighting } from 'three/addons/lighting/DynamicLighting.js';
 import { chatLine, genBotName, genPlayerName, pickOf, type ChatKind } from './names';
 
 export type EngineState = 'intro' | 'playing' | 'paused' | 'over';
+
+/** Reusable scratch record for one local-flare selection candidate. */
+interface FlareCandidate {
+  src: number;
+  x: number;
+  y: number;
+  z: number;
+  color: number;
+  /** score before occlusion (an upper bound on the final score) */
+  upper: number;
+  /** score after occlusion */
+  score: number;
+  radius: number;
+  visibility: number;
+  isStrip: boolean;
+  stripSamples: number;
+}
 
 export interface HudState {
   hp: number;
@@ -70,6 +88,25 @@ export interface HudState {
   fighterCount: number;
   /** seconds until the round starts, 0 when no countdown is running */
   startIn: number;
+  /** benchmark progress 0..1 while a benchmark run is active, -1 otherwise */
+  bench: number;
+  benchFps: number;
+}
+
+export interface BenchResult {
+  avgFps: number;
+  /** 1% low FPS (from the slowest 1% of frames) */
+  low1Fps: number;
+  low01Fps: number;
+  minFps: number;
+  maxFps: number;
+  avgMs: number;
+  frames: number;
+  duration: number;
+  drawCalls: number;
+  triangles: number;
+  resolution: string;
+  verdict: string;
 }
 
 export type GameEvent =
@@ -118,6 +155,7 @@ export interface EngineHandlers {
   onEvent(e: GameEvent): void;
   onState(s: EngineState): void;
   onOver(r: MatchResult): void;
+  onBenchmark?(r: BenchResult): void;
 }
 
 export interface FakeProfile {
@@ -161,6 +199,12 @@ const TAU = Math.PI * 2;
 
 const clamp = (v: number, a: number, b: number) => Math.max(a, Math.min(b, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
+const smoothstep = (a: number, b: number, v: number) => {
+  const t = clamp((v - a) / (b - a), 0, 1);
+  return t * t * (3 - 2 * t);
+};
+/** Centre + four half-radius probes used to estimate how much of the sun disc is visible. */
+const SUN_DISC_SAMPLES = [[0, 0], [0.55, 0], [-0.55, 0], [0, 0.55], [0, -0.55]] as const;
 function angDiff(a: number, b: number) {
   let d = (b - a) % TAU;
   if (d > Math.PI) d -= TAU;
@@ -201,7 +245,10 @@ function freeTree(o: THREE.Object3D) {
 
 export class Engine {
   // three
-  renderer: THREE.WebGLRenderer;
+  renderer: THREE.WebGPURenderer;
+  /** WebGPURenderer.init() is async; nothing may render or touch PMREM/capabilities before this */
+  private rendererReady = false;
+  private rendererFailed = false;
   scene = new THREE.Scene();
   camera: THREE.PerspectiveCamera;
   wScene = new THREE.Scene();
@@ -302,6 +349,120 @@ export class Engine {
   vfx = { damage: 0, heal: 0, flash: 0, speed: 0, low: 0, spread: 0.01, fov: 1.5, yaw: 0, indicators: [] as { ang: number; life: number }[] };
   private pm = 1;
   post: PostPipeline | null = null;
+  private dust: AmbientDust | null = null;
+  /** pool of real spotlights assigned to the nearest static coloured fixtures */
+  private fixtureLights: THREE.SpotLight[] = [];
+  private fixtureAssign: number[] = [];
+  private fixtureNext: number[] = [];
+  private fixtureRank: number[] = [];
+  private fixturePropDirty: boolean[] = [];
+  private fixtureShadowDirty: boolean[] = [];
+  /** per-fixture rank scratch: `d` = weighted sort key, `r2` = true squared distance */
+  private fixtureOrder: { i: number; d: number; r2: number }[] = [];
+  private fixtureSelected: boolean[] = [];
+  private fixtureUsed: boolean[] = [];
+  private fixtureRankByIndex: number[] = [];
+  /** fixture indices that survived distance + raycast-visibility selection, in rank order */
+  private fixtureSelectedOrder: number[] = [];
+  private fixtureCache: LightFixture[] | null = null;
+  private fixtureCacheKey = '';
+  /**
+   * Raycast-trimmed spot cutoffs per fixture. A fixture's position, angle
+   * and authored distance never change within a level, so its five
+   * cone-probe raycasts only ever need to run once. Derived fixture objects
+   * are memoised per level (see deriveEmissiveSources), which keeps these
+   * WeakMap keys stable across pool rebuilds.
+   */
+  private fixtureRangeCache = new WeakMap<LightFixture, number>();
+  /** authored lamps + pads + segmented neon/glow geometry for this level */
+  private emissiveCache: LightFixture[] | null = null;
+  private emissiveCacheKey = '';
+  private fixtureSortX = Infinity;
+  private fixtureSortY = Infinity;
+  private fixtureSortZ = Infinity;
+  private fixtureBudget = -1;
+  /** camera-distance cutoff used by the last fixture selection; Infinity = no cutoff */
+  private fixtureMaxDist = -1;
+  /** Number of leading pool slots created with castShadow=true; fixed until the pool is rebuilt. */
+  private fixtureShadowSlots = 0;
+  /**
+   * True after a real WebGPU backend is confirmed. Three's batched
+   * DynamicLighting path is then installed lazily if/when the coloured-light
+   * limit is set above 14 or to Unlimited; it lets those settings expand the
+   * spotlight pool without recompiling every material for each new count. The
+   * WebGL fallback keeps the old 14-light budget rather than declaring
+   * large uniform arrays it may not be able to compile.
+   */
+  private dynamicFixtureLighting = false;
+  private dynamicLightingInstalled = false;
+  private fixtureT = 0;
+  private pmrem: THREE.PMREMGenerator | null = null;
+  private envRT: THREE.RenderTarget | null = null;
+  /**
+   * PMREM environments by theme/sun key (small LRU). The environment is a
+   * pure function of the theme colours + base sun direction, so switching
+   * themes back and forth reuses the earlier render instead of paying a
+   * PMREM pass (and a dispose) on every switch.
+   */
+  private envCache = new Map<string, THREE.RenderTarget>();
+  /** last applied `shadows|shadowSoftness` pair; gates sun-shadow refreshes in applySettings */
+  private sunShadowKey = '';
+  /** smoothed 0..1 geometric visibility of the sun (CPU raycast) — gates sun flare only */
+  private sunOcc = 1;
+  private sunOccTarget = 1;
+  private sunOccT = 0;
+  /** visible level emitters currently feeding local lens flare (dynamic, reusable objects) */
+  private flarePicks: {
+    ax: number;
+    ay: number;
+    az: number;
+    bx: number;
+    by: number;
+    bz: number;
+    color: number;
+    base: number;
+    radius: number;
+    ring: number;
+    occ: number;
+    target: number;
+    /** index into emissiveSources(); identity for occlusion carry-over */
+    src: number;
+  }[] = [];
+  private flarePickCount = 0;
+  private flarePickT = 0;
+  /** previous tick's smoothed occlusion by source index (avoids an 8 Hz fade-in pulse after reselection) */
+  private flarePrevOcc = new Map<number, number>();
+  /**
+   * Selection scratch: candidates are collected with their unoccluded
+   * (upper-bound) scores, sorted once, then raycast in that order — capped
+   * tiers can stop as soon as no remaining upper bound can enter the top N.
+   * Pool objects are reused; `flareCandidates` is just the live ref order.
+   */
+  private flareCandidatePool: FlareCandidate[] = [];
+  private flareCandidates: FlareCandidate[] = [];
+  /** best final scores seen so far this tick (desc, capped at the tier limit) */
+  private flareTopFinal: number[] = [];
+  private flareParamPool: FlareSourceParam[] = [];
+  private flareParams: FlareSourceParam[] = [];
+  private sunRight = new THREE.Vector3(1, 0, 0);
+  private sunUp = new THREE.Vector3(0, 1, 0);
+  private sunSampleDir = new THREE.Vector3();
+  private focusDist = 18;
+  private frameDt = 1 / 60;
+  private shadowHalf = 38;
+  private shadowSize = 1024;
+  private sunBaseColor = new THREE.Color(0xffffff);
+  private warmSun = new THREE.Color(0xff9a4d);
+  // showcase / benchmark
+  private vistaCurve: THREE.CatmullRomCurve3 | null = null;
+  private vistaLookCurve: THREE.CatmullRomCurve3 | null = null;
+  benchActive = false;
+  private benchT = 0;
+  private benchDur = 30;
+  private benchFrames: number[] = [];
+  private benchCalls = 0;
+  private benchTris = 0;
+  private benchPrevNoLock = false;
   private lights: { l: THREE.PointLight; t: number; dur: number; base: number }[] = [];
   private lightsOn = false;
   cheats: Cheats = { ...NO_CHEATS };
@@ -312,6 +473,15 @@ export class Engine {
   aimTarget: Fighter | null = null;
   private tmpV = new THREE.Vector3();
   private tmpV2 = new THREE.Vector3();
+  private fixtureClosest = new THREE.Vector3();
+  private flareViewA = new THREE.Vector3();
+  private flareViewB = new THREE.Vector3();
+  private flareProjA = new THREE.Vector3();
+  private flareProjB = new THREE.Vector3();
+  private flareUvA = new THREE.Vector2();
+  private flareUvB = new THREE.Vector2();
+  private flareRadial = Infinity;
+  private flareDepthA = 1;
   private rayCol = new THREE.Color();
   private sunUv = new THREE.Vector2();
   private nextId = 1;
@@ -327,6 +497,10 @@ export class Engine {
   private lowFpsT = 0;
   private highFpsT = 0;
   private scaleAdapt = 1;
+  private bufferW = 0;
+  private bufferH = 0;
+  private viewAspect = 0;
+  private maxAnisoCache = 0;
   private hudT = 0;
   private frameN = 0;
   private listeners: [EventTarget, string, EventListenerOrEventListenerObject, AddEventListenerOptions?][] = [];
@@ -376,8 +550,14 @@ export class Engine {
     const s = this.settings;
     this.level = getLevel(opts.server.level, opts.server.gen);
 
-    // renderer
-    this.renderer = new THREE.WebGLRenderer({ antialias: s.antialias, powerPreference: 'high-performance' });
+    // WebGPU renderer (Three falls back to WebGL2 inside init() where WebGPU is
+    // unavailable). Canvas MSAA only matters for the direct-render path/'native' AA;
+    // the TSL post pipeline sets its own pass sample counts.
+    this.renderer = new THREE.WebGPURenderer({
+      antialias: aaModeOf(s) === 'native',
+      powerPreference: 'high-performance',
+      samples: aaModeOf(s) === 'native' ? 4 : 0,
+    });
     this.renderer.autoClear = false;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.15;
@@ -394,9 +574,10 @@ export class Engine {
     this.wCam = new THREE.PerspectiveCamera(58, 1, 0.01, 10);
 
     // lights
-    this.hemi = new THREE.HemisphereLight(th.hemiSky, th.hemiGround, 2.6);
+    this.hemi = new THREE.HemisphereLight(th.hemiSky, th.hemiGround, 1.85);
     this.scene.add(this.hemi);
     this.sun = new THREE.DirectionalLight(th.lightColor, 3.4);
+    this.sunBaseColor.setHex(th.lightColor);
     this.sunDir.set(th.sunDir[0], th.sunDir[1], th.sunDir[2]).normalize();
     this.sunBase.copy(this.sunDir);
     this.rayCol.setHex(th.sunColor);
@@ -407,14 +588,23 @@ export class Engine {
     this.sun.shadow.bias = -0.0005;
     this.sun.shadow.normalBias = 0.05;
     this.scene.add(this.sun, this.sun.target);
-    this.wScene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 2.6));
+    this.wScene.add(new THREE.HemisphereLight(0xffffff, 0x444466, 2.2));
     const wd = new THREE.DirectionalLight(0xffffff, 3);
     wd.position.set(1, 2, 2);
     this.wScene.add(wd);
 
-    // level
-    this.levelObjs = buildLevelObjects(this.level, this.renderer.capabilities.getMaxAnisotropy());
+    // level (anisotropy is raised to the real backend limit once init() resolves)
+    this.levelObjs = buildLevelObjects(this.level, this.maxAnisotropy());
     this.scene.add(this.levelObjs.group);
+    this.dust = new AmbientDust(this.scene);
+    this.dust.setTint(th.sunColor);
+    this.setupFixtureLights();
+    if (this.level.vista?.length) {
+      this.vistaCurve = new THREE.CatmullRomCurve3(this.level.vista.map((p) => new THREE.Vector3(p[0], p[1], p[2])), true, 'centripetal');
+      if (this.level.vistaLook?.length === this.level.vista.length) {
+        this.vistaLookCurve = new THREE.CatmullRomCurve3(this.level.vistaLook.map((p) => new THREE.Vector3(p[0], p[1], p[2])), true, 'centripetal');
+      }
+    }
     this.world = new World(this.level.boxes);
     this.nav = new Nav(this.world, this.level.w, this.level.d);
     this.map = renderLevelMap(this.level, 256);
@@ -440,8 +630,54 @@ export class Engine {
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(this.container);
     this.setState('intro');
-    this.last = performance.now();
-    this.raf = requestAnimationFrame(this.loop);
+    this.startRenderer();
+  }
+
+  /** Backend anisotropy limit; 1 until the async renderer init has completed. */
+  private maxAnisotropy(): number {
+    if (this.maxAnisoCache > 0) return this.maxAnisoCache;
+    if (!this.rendererReady) return 1;
+    try {
+      this.maxAnisoCache = Math.max(1, this.renderer.getMaxAnisotropy());
+    } catch {
+      this.maxAnisoCache = 1;
+    }
+    return this.maxAnisoCache;
+  }
+
+  /**
+   * WebGPURenderer must finish init() before the first frame, PMREM build, or
+   * capability query. The constructor/React flow stays synchronous; the first
+   * RAF (and a second applySettings for backend-dependent values) is deferred.
+   */
+  private startRenderer() {
+    void this.renderer
+      .init()
+      .then(() => {
+        if (this.disposed) {
+          void this.renderer.dispose();
+          return;
+        }
+        this.rendererReady = true;
+        // Record whether this is a genuine WebGPU backend. applySettings
+        // (called just below, before the first frame) lazily installs
+        // Three's batched DynamicLighting path if the highest coloured-
+        // light tier is in use.
+        const backend = this.renderer.backend as unknown as { isWebGPUBackend?: boolean };
+        this.dynamicFixtureLighting = backend.isWebGPUBackend === true;
+        // Force one post-init setSize even if the constructor already used
+        // the same dimensions before the backend existed.
+        this.bufferW = 0;
+        this.bufferH = 0;
+        this.applySettings(this.settings);
+        this.resize();
+        this.last = performance.now();
+        if (!this.raf) this.raf = requestAnimationFrame(this.loop);
+      })
+      .catch((err) => {
+        this.rendererFailed = true;
+        console.error('[arena] WebGPURenderer init failed', err);
+      });
   }
 
   /* ============================================================ setup helpers */
@@ -530,8 +766,886 @@ export class Engine {
     }
   }
 
+  private fixtureBudgetFor(s: Settings): number {
+    const requested = coloredLightLimitOf(s);
+    if (requested < 0) return this.dynamicLightingInstalled ? Infinity : 14;
+    // 768 is the DynamicLighting spot allocation. A finite slider value above
+    // 14 additionally needs that batch installed; without it (WebGL fallback)
+    // the reliable per-light path keeps the established 14-light ceiling.
+    const limit = clamp(Math.floor(requested), 0, 768);
+    return this.dynamicLightingInstalled ? limit : Math.min(limit, 14);
+  }
+
+  private fixtureMaxDistanceFor(s: Settings): number {
+    const requested = coloredLightDistanceOf(s);
+    return requested < 0 ? Infinity : clamp(requested, 0, 10000);
+  }
+
+  private coloredLightsWantDynamicBatch(s: Settings): boolean {
+    const requested = coloredLightLimitOf(s);
+    return requested < 0 || requested > 14;
+  }
+
+  private fixtureShadowSlotsFor(s: Settings): number {
+    const budget = this.fixtureBudgetFor(s);
+    if (!budget || s.shadows === 0) return 0;
+    if (s.shadows === 1) return Math.min(4, budget);
+    return budget <= 4 ? 4 : budget <= 8 ? 6 : 8;
+  }
+
+  /**
+   * Creates the pool of spotlights reused by the nearest coloured fixtures.
+   * Formerly shadowless point lights, which necessarily shone through ceilings
+   * and wall edges; aiming each fixture down its visible cone removes most of
+   * that bleed before shadows are even considered.
+   *
+   * `castShadow` is assigned once, here, to a fixed prefix of pool slots. The
+   * WebGPU/TSL light cache is much happier with that than with flipping the
+   * flag on live lights: if settings require a different number of shadowed
+   * slots, applySettings/updateFixtureLights rebuild the pool instead.
+   */
+  private setupFixtureLights(shadowSlots = this.fixtureShadowSlotsFor(this.settings)) {
+    for (const l of this.fixtureLights) {
+      l.dispose();
+      this.scene.remove(l);
+      this.scene.remove(l.target);
+    }
+    this.fixtureLights = [];
+    this.fixtureAssign = [];
+    this.fixtureNext = [];
+    this.fixtureRank = [];
+    this.fixturePropDirty = [];
+    this.fixtureShadowDirty = [];
+    this.fixtureOrder = [];
+    this.fixtureSelected = [];
+    this.fixtureUsed = [];
+    this.fixtureRankByIndex = [];
+    this.fixtureSelectedOrder = [];
+    this.fixtureCache = null;
+    this.fixtureCacheKey = '';
+    this.emissiveCache = null;
+    this.emissiveCacheKey = '';
+    this.flarePickCount = 0;
+    this.flarePickT = 0;
+    this.fixtureSortX = Infinity;
+    this.fixtureSortY = Infinity;
+    this.fixtureSortZ = Infinity;
+    this.fixtureBudget = -1;
+    this.fixtureMaxDist = -1;
+    this.fixtureShadowSlots = clamp(Math.floor(shadowSlots), 0, 14);
+    this.ensureFixturePool(14);
+    this.fixtureT = 0;
+  }
+
+  /**
+   * Grows the reusable spotlight pool. The first 14 slots are created up
+   * front; with a WebGPU-batched limit above 14 (or Unlimited), selection may
+   * legitimately need more, and those extra objects are created once and
+   * then reused (never toggled into shadow casters later).
+   */
+  private ensureFixturePool(count: number) {
+    while (this.fixtureLights.length < count) {
+      const i = this.fixtureLights.length;
+      const l = new THREE.SpotLight(0xffffff, 0, 18, 1.02, 0.5, 1.45);
+      l.visible = false;
+      l.castShadow = i < this.fixtureShadowSlots;
+      l.shadow.mapSize.set(384, 384);
+      l.shadow.bias = -0.00012;
+      l.shadow.normalBias = 0.04;
+      l.shadow.radius = 2;
+      l.shadow.blurSamples = 6;
+      l.shadow.autoUpdate = false;
+      // Deliberately leave shadow.camera.layers at Three's default. A previous
+      // layer-2 filter attempted static-only fixture shadows, but that added
+      // an under-tested WebGPU shadow-path dependency; the default camera
+      // mask is the reliable path and guarantees level geometry is rendered
+      // into these maps.
+      this.scene.add(l);
+      this.scene.add(l.target);
+      this.fixtureLights.push(l);
+      this.fixtureAssign.push(-1);
+      this.fixtureNext.push(-1);
+      this.fixtureRank.push(999);
+      this.fixturePropDirty.push(true);
+      this.fixtureShadowDirty.push(true);
+    }
+  }
+
+  /**
+   * Every static emitter in the current level: authored lamps/tower lights,
+   * jump pads, and one grouped emitter per merged straight neon run.
+   * Cached per level; this one list feeds both flare and coloured lighting,
+   * so a visible neon strip cannot light a wall in one system and disappear
+   * from the other.
+   */
+  private emissiveSources(): LightFixture[] {
+    const key = this.level.key ?? this.level.id;
+    if (this.emissiveCache && this.emissiveCacheKey === key) return this.emissiveCache;
+    this.emissiveCache = deriveEmissiveSources(this.level);
+    this.emissiveCacheKey = key;
+    this.flarePickCount = 0;
+    this.flarePickT = 0;
+    return this.emissiveCache;
+  }
+
+  /**
+   * All lightable fixtures of the current level, cached per level/budget.
+   * Pads join the real spotlight pool once the visible-light limit reaches
+   * the old Medium budget (8, or Unlimited), so a 4-light budget still spends
+   * its scarce slots on lamps/neon. Lamps and neon compete at every
+   * non-zero limit; Unlimited has no ranked count cap.
+   */
+  private fixtureList(): LightFixture[] {
+    const requestedLimit = coloredLightLimitOf(this.settings);
+    const includePads = requestedLimit < 0 || requestedLimit >= 8;
+    const key = `${this.level.key ?? this.level.id}|${includePads ? 1 : 0}`;
+    if (this.fixtureCache && this.fixtureCacheKey === key) return this.fixtureCache;
+    const all = this.emissiveSources();
+    // A pad's visible beam is an uplight, but deriveEmissiveSources places
+    // its pooled spot part-way up the beam and aims it back down: the pad
+    // gets a coloured pool, while cone/range/shadow still limit wall spill.
+    // Neon entries are already grouped: one wide source per merged straight
+    // segment, with endpoints retained only for ranking/occlusion tests.
+    const list: LightFixture[] = all.filter((f) => includePads || f.kind !== 'pad');
+    this.fixtureCache = list;
+    this.fixtureCacheKey = key;
+    this.fixtureOrder = list.map((_, i) => ({ i, d: 0, r2: 0 }));
+    this.fixtureSelected = new Array(list.length).fill(false);
+    this.fixtureUsed = new Array(list.length).fill(false);
+    this.fixtureRankByIndex = new Array(list.length).fill(999);
+    this.fixtureSelectedOrder = [];
+    this.fixtureSortX = Infinity;
+    this.fixtureSortY = Infinity;
+    this.fixtureSortZ = Infinity;
+    return list;
+  }
+
+  /** Writes the closest point on an emitter (point or strip) to `out`. */
+  private closestEmitterPoint(f: LightFixture, x: number, y: number, z: number, out: THREE.Vector3) {
+    // Point emitters (authored lamps, pads) have no second endpoint: the
+    // projection math below would collapse to the centre anyway.
+    if (f.x2 === undefined) {
+      out.set(f.x, f.y, f.z);
+      return out;
+    }
+    const bx = f.x2;
+    const by = f.y2 ?? f.y;
+    const bz = f.z2 ?? f.z;
+    const ax = 2 * f.x - bx;
+    const ay = 2 * f.y - by;
+    const az = 2 * f.z - bz;
+    const abx = bx - ax;
+    const aby = by - ay;
+    const abz = bz - az;
+    const len2 = abx * abx + aby * aby + abz * abz;
+    const t = len2 > 1e-9 ? clamp(((x - ax) * abx + (y - ay) * aby + (z - az) * abz) / len2, 0, 1) : 0;
+    out.set(ax + abx * t, ay + aby * t, az + abz * t);
+    return out;
+  }
+
+  /**
+   * Fraction of an emitter visible from the camera under real level raycasts.
+   * Strips are sampled along their length (a 100 m wall line can be partly
+   * behind a tower and partly visible). For pool selection, one extra sample
+   * just inside the fixture's cone prevents a lamp whose bulb is hidden by a
+   * beam—but whose lit pool/cone is plainly in view—from being culled.
+   */
+  private emitterVisibility(f: LightFixture, stripSamples: number, includeConeSample = false, anyVisibleOnly = false): number {
+    if (!this.world) return 1;
+    const cp = this.camera.position;
+    const bx = f.x2 ?? f.x;
+    const by = f.y2 ?? f.y;
+    const bz = f.z2 ?? f.z;
+    const ax = f.x2 === undefined ? f.x : 2 * f.x - bx;
+    const ay = f.y2 === undefined ? f.y : 2 * f.y - by;
+    const az = f.z2 === undefined ? f.z : 2 * f.z - bz;
+    const isStrip = f.x2 !== undefined && (ax !== bx || ay !== by || az !== bz);
+    const samples = isStrip ? Math.max(2, stripSamples) : 1;
+    const total = samples + (includeConeSample ? 1 : 0);
+    const tolerance = 0.5 + (f.radius ?? 0.4) * 0.35;
+    let visible = 0;
+
+    for (let s = 0; s < total; s++) {
+      let x = f.x;
+      let y = f.y;
+      let z = f.z;
+      if (s < samples && isStrip) {
+        const t = samples === 1 ? 0.5 : s / (samples - 1);
+        x = ax + (bx - ax) * t;
+        y = ay + (by - ay) * t;
+        z = az + (bz - az) * t;
+      } else if (s >= samples) {
+        y += ((f.dirY ?? -1) < 0 ? -1 : 1) * 1.4;
+      }
+      const dx = x - cp.x;
+      const dy = y - cp.y;
+      const dz = z - cp.z;
+      const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (dist < 0.05) {
+        // Boolean callers (fixture-pool selection) only test `> 0`: the
+        // first clear sample settles it, so a visible point never pays for
+        // its cone probe and a visible strip never pays for its remaining
+        // samples. The fractional result is unchanged for flare callers.
+        if (anyVisibleOnly) return 1;
+        visible++;
+        continue;
+      }
+      const inv = 1 / dist;
+      const hit = this.world.raycast(cp.x, cp.y, cp.z, dx * inv, dy * inv, dz * inv, dist + 1);
+      if (hit === Infinity || hit >= dist - tolerance) {
+        if (anyVisibleOnly) return 1;
+        visible++;
+      }
+    }
+    return visible / total;
+  }
+
+  /**
+   * An unlimited coloured-light count (or a maxed flare slider) removes the
+   * local-flare count cap. Finite light limits scale the flare cap with them
+   * (preserving the old preset points: 4 lights→5 flares, 8→12), because the
+   * flare pass is per-source shader work just like the spotlight pool.
+   */
+  private flareSourceLimit(): number {
+    const requested = coloredLightLimitOf(this.settings);
+    if (requested < 0 || this.settings.flare >= 0.999) return Infinity;
+    if (requested <= 4) return 5;
+    return Math.min(1024, Math.ceil(requested * 1.5));
+  }
+
+  private ensureFlareCapacity(count: number) {
+    while (this.flarePicks.length < count) {
+      this.flarePicks.push({ ax: 0, ay: 0, az: 0, bx: 0, by: 0, bz: 0, color: 0xffffff, base: 0, radius: 0.4, ring: 1, occ: 0, target: 0, src: -1 });
+    }
+    while (this.flareParamPool.length < count) {
+      this.flareParamPool.push({
+        uv: new THREE.Vector2(0.5, 0.5),
+        color: new THREE.Color(0, 0, 0),
+        strength: 0,
+        radius: 0.05,
+        ring: 1,
+      });
+    }
+  }
+
+  private ensureFlareCandidateCapacity(count: number) {
+    while (this.flareCandidatePool.length < count) {
+      this.flareCandidatePool.push({ src: -1, x: 0, y: 0, z: 0, color: 0xffffff, upper: 0, score: 0, radius: 0.4, visibility: 0, isStrip: false, stripSamples: 1 });
+    }
+  }
+
+  /**
+   * Projects an emitter segment with near-plane clipping. A long neon run
+   * can pass beside/behind the camera; projecting its raw endpoints would
+   * mirror the behind-camera endpoint across the screen and create a false
+   * streak. Results are left in flareUvA/flareUvB/flareRadial, with the
+   * clipped first-endpoint view depth in flareDepthA for flare radius.
+   */
+  private projectEmitterSegment(
+    ax: number,
+    ay: number,
+    az: number,
+    bx: number,
+    by: number,
+    bz: number,
+    cam: THREE.PerspectiveCamera,
+  ): boolean {
+    const a = this.flareViewA.set(ax, ay, az).applyMatrix4(cam.matrixWorldInverse);
+    const nearZ = -Math.max(0.08, cam.near * 1.25);
+    // Degenerate segment = a single point (every local lens flare): one
+    // transform/projection instead of two identical ones.
+    if (ax === bx && ay === by && az === bz) {
+      if (a.z > nearZ) {
+        this.flareRadial = Infinity;
+        this.flareDepthA = 1;
+        return false;
+      }
+      this.flareDepthA = Math.max(0.08, -a.z);
+      this.flareProjA.copy(a).applyMatrix4(cam.projectionMatrix);
+      this.flareProjB.copy(this.flareProjA);
+      this.flareUvA.set(this.flareProjA.x * 0.5 + 0.5, this.flareProjA.y * 0.5 + 0.5);
+      this.flareUvB.copy(this.flareUvA);
+      const px = this.flareProjA.x / 1.08;
+      const py = this.flareProjA.y / 1.14;
+      this.flareRadial = Math.sqrt(px * px + py * py);
+      return true;
+    }
+    const b = this.flareViewB.set(bx, by, bz).applyMatrix4(cam.matrixWorldInverse);
+    if (a.z > nearZ && b.z > nearZ) {
+      this.flareRadial = Infinity;
+      this.flareDepthA = 1;
+      return false;
+    }
+    if (a.z > nearZ) a.lerp(b, (nearZ - a.z) / (b.z - a.z));
+    else if (b.z > nearZ) b.lerp(a, (nearZ - b.z) / (a.z - b.z));
+    this.flareDepthA = Math.max(0.08, -a.z);
+
+    this.flareProjA.copy(a).applyMatrix4(cam.projectionMatrix);
+    this.flareProjB.copy(b).applyMatrix4(cam.projectionMatrix);
+    this.flareUvA.set(this.flareProjA.x * 0.5 + 0.5, this.flareProjA.y * 0.5 + 0.5);
+    this.flareUvB.set(this.flareProjB.x * 0.5 + 0.5, this.flareProjB.y * 0.5 + 0.5);
+
+    const x0 = this.flareProjA.x / 1.08;
+    const y0 = this.flareProjA.y / 1.14;
+    const dx = this.flareProjB.x / 1.08 - x0;
+    const dy = this.flareProjB.y / 1.14 - y0;
+    const len2 = dx * dx + dy * dy;
+    const t = len2 > 1e-9 ? clamp(-(x0 * dx + y0 * dy) / len2, 0, 1) : 0;
+    const rx = x0 + dx * t;
+    const ry = y0 + dy * t;
+    this.flareRadial = Math.sqrt(rx * rx + ry * ry);
+    return true;
+  }
+
+  /**
+   * Selects and projects level emitters that should produce local lens
+   * flare. Selection and world-raycast occlusion run at roughly 8 Hz; the
+   * chosen emitter centres are then projected every frame so their ghosts
+   * track the camera smoothly. A merged neon segment produces one ordinary
+   * point flare at its centre (its endpoints are used only to raycast how
+   * much of the segment is visible). Lower coloured-light tiers keep a small
+   * ranked cap; the highest tier has no count cap—every emitter/grouped
+   * segment in the frustum with any raycast-visible portion is submitted.
+   */
+  private updateLocalFlares(cam: THREE.PerspectiveCamera) {
+    cam.updateMatrixWorld();
+    const cp = cam.position;
+    const tanF = Math.tan(THREE.MathUtils.degToRad(cam.fov * 0.5));
+    const limit = this.flareSourceLimit();
+    this.flarePickT -= this.frameDt;
+
+    if (this.flarePickT <= 0) {
+      this.flarePickT = 0.12;
+      this.flarePrevOcc.clear();
+      for (let i = 0; i < this.flarePickCount; i++) {
+        const prev = this.flarePicks[i];
+        if (prev.src >= 0) this.flarePrevOcc.set(prev.src, prev.occ);
+      }
+      this.flarePickCount = 0;
+      // Phase 1: collect every in-view candidate with its unoccluded score.
+      // Occlusion can only lower that score, so it is an upper bound used to
+      // order (and, at capped tiers, prune) the raycasts in phase 2.
+      const sources = this.emissiveSources();
+      const candidates = this.flareCandidates;
+      candidates.length = 0;
+      for (let si = 0; si < sources.length; si++) {
+        const f = sources[si];
+        // One point flare per emitter / merged neon segment, placed at the
+        // segment centre. The segment endpoints still exist on the fixture
+        // for the multi-sample visibility test below, but they are never
+        // passed to the flare shader as a line.
+        const dx = f.x - cp.x;
+        const dy = f.y - cp.y;
+        const dz = f.z - cp.z;
+        const dist2 = dx * dx + dy * dy + dz * dz;
+        if (dist2 < 0.1225 || dist2 > 176400) continue; // 0.35² … 420²
+        if (!this.projectEmitterSegment(f.x, f.y, f.z, f.x, f.y, f.z, cam)) continue;
+        const radial = this.flareRadial;
+        if (radial > 1.3) continue;
+        const dist = Math.sqrt(dist2);
+
+        const worldRadius = f.radius ?? 0.4;
+        const isStrip = f.x2 !== undefined && (f.stripLength ?? 0) > 0.05;
+        // A grouped segment gets one point flare, sized by an effective
+        // area radius: a long connected strip emits more total light than a
+        // same-thickness isolated bulb, even though the flare itself is round.
+        const effectiveRadius = isStrip
+          ? clamp(Math.sqrt(Math.max(0.08, f.stripWidth ?? worldRadius * 2) * Math.min(f.stripLength ?? 1, 20)) * 0.5, 0.22, 1.5)
+          : worldRadius;
+        const radiusUv = clamp(effectiveRadius / (2 * dist * tanF), 0.012, 0.18);
+        // A bright point remains flare-worthy at distance, but its total
+        // image energy still falls as its apparent area shrinks. The square
+        // root distance term favours nearby lamps/neon without making a
+        // tower beacon vanish merely because it is across the arena; the
+        // final scale puts the result in the shader's intended strength range.
+        let score =
+          (f.flare ?? 0.18) *
+          clamp((1.5 * radiusUv) / (radiusUv + 0.035), 0.12, 1) *
+          Math.sqrt(18 / (18 + dist)) *
+          1.65;
+        score *= smoothstep(1.3, 0.72, radial);
+        if (score < (limit === Infinity ? 0.0005 : 0.008)) continue;
+
+        this.ensureFlareCandidateCapacity(candidates.length + 1);
+        const cand = this.flareCandidatePool[candidates.length];
+        cand.src = si;
+        cand.x = f.x;
+        cand.y = f.y;
+        cand.z = f.z;
+        cand.color = f.color;
+        cand.upper = score;
+        cand.score = 0;
+        cand.radius = effectiveRadius;
+        cand.visibility = 0;
+        cand.isStrip = isStrip;
+        const stripLength = f.stripLength ?? 0;
+        cand.stripSamples = !isStrip ? 1 : stripLength > 60 ? 9 : stripLength > 25 ? 7 : 5;
+        candidates.push(cand);
+      }
+
+      // Phase 2: raycast occlusion in upper-bound order. At capped tiers,
+      // once the top N is full, a candidate whose upper bound is below the
+      // current Nth final score can never enter it (occlusion only lowers
+      // scores) — and because the list is sorted, neither can anything after
+      // it, so the remaining raycasts are skipped entirely. Visible
+      // candidates are compacted in place, then ranked by final score once.
+      candidates.sort((a, b) => b.upper - a.upper);
+      const topFinal = this.flareTopFinal;
+      topFinal.length = 0;
+      let visibleCount = 0;
+      for (let ci = 0; ci < candidates.length; ci++) {
+        const cand = candidates[ci];
+        if (limit !== Infinity && topFinal.length >= limit && cand.upper < topFinal[limit - 1]) break;
+        // Multi-sample the full strip for visibility: a partly hidden run's
+        // single point flare is scaled by its visible fraction, while a fully
+        // hidden run/lamp is not submitted at all.
+        const visibility = this.emitterVisibility(sources[cand.src], cand.stripSamples, false);
+        if (visibility <= 0) continue;
+        cand.visibility = visibility;
+        cand.score = cand.upper * (cand.isStrip ? 0.3 + 0.7 * visibility : visibility);
+        candidates[visibleCount++] = cand;
+        if (limit !== Infinity) {
+          let pos = 0;
+          while (pos < topFinal.length && topFinal[pos] >= cand.score) pos++;
+          if (pos < limit) {
+            const len = Math.min(limit, topFinal.length + 1);
+            topFinal.length = len;
+            for (let k = len - 1; k > pos; k--) topFinal[k] = topFinal[k - 1];
+            topFinal[pos] = cand.score;
+          }
+        }
+      }
+      candidates.length = visibleCount;
+      candidates.sort((a, b) => b.score - a.score || a.src - b.src);
+      const take = limit === Infinity ? visibleCount : Math.min(limit, visibleCount);
+      this.ensureFlareCapacity(take);
+      for (let i = 0; i < take; i++) {
+        const cand = candidates[i];
+        const pick = this.flarePicks[i];
+        pick.ax = cand.x;
+        pick.ay = cand.y;
+        pick.az = cand.z;
+        pick.bx = cand.x;
+        pick.by = cand.y;
+        pick.bz = cand.z;
+        pick.color = cand.color;
+        pick.base = cand.score;
+        pick.radius = cand.radius;
+        pick.ring = 1;
+        pick.occ = this.flarePrevOcc.get(cand.src) ?? 0;
+        pick.target = cand.visibility;
+        pick.src = cand.src;
+      }
+      this.flarePickCount = take;
+
+      let total = 0;
+      for (let i = 0; i < this.flarePickCount; i++) total += this.flarePicks[i].base * this.flarePicks[i].target;
+      // Energy normalization is not a source-count cap: crowded lamps and
+      // neon runs remain present, but dozens of overlapping ghost chains do
+      // not stack linearly to white. The uncapped tier uses a gentler
+      // square-root compression because suppressing every source by 1/N
+      // would make a legitimately busy vista look no brighter than one lamp.
+      if (limit === Infinity) {
+        if (total > 3) {
+          const scale = Math.sqrt(3 / total);
+          for (let i = 0; i < this.flarePickCount; i++) this.flarePicks[i].base *= scale;
+        }
+      } else if (total > 1.6) {
+        const scale = 1.6 / total;
+        for (let i = 0; i < this.flarePickCount; i++) this.flarePicks[i].base *= scale;
+      }
+    }
+
+    const blend = Math.min(1, this.frameDt * 9);
+    this.flareParams.length = 0;
+    let active = 0;
+    for (let i = 0; i < this.flarePickCount; i++) {
+      const pick = this.flarePicks[i];
+      pick.occ += (pick.target - pick.occ) * blend;
+
+      // Picks are points by construction (ax≡bx, …): distance is to the
+      // centre, tested squared — no closest-point-on-segment math needed.
+      const dx = pick.ax - cp.x;
+      const dy = pick.ay - cp.y;
+      const dz = pick.az - cp.z;
+      if (dx * dx + dy * dy + dz * dz < 0.0025) continue; // 0.05²
+      if (!this.projectEmitterSegment(pick.ax, pick.ay, pick.az, pick.bx, pick.by, pick.bz, cam)) continue;
+      if (this.flareRadial > 1.35) continue;
+      const strength = pick.base * pick.occ * smoothstep(1.32, 0.8, this.flareRadial);
+      if (strength <= 0) continue; // contributes nothing to the shader loop
+
+      this.ensureFlareCapacity(active + 1);
+      const param = this.flareParamPool[active];
+      param.uv.copy(this.flareUvA);
+      param.color.setHex(pick.color);
+      param.radius = clamp(pick.radius / (2 * this.flareDepthA * tanF), 0.008, 0.18);
+      param.ring = pick.ring;
+      param.strength = strength;
+      this.flareParams[active++] = param;
+    }
+  }
+
+  /**
+   * Effective cutoff for a fixture, estimated from the first level surfaces
+   * inside its cone (axis + four near-edge rays). Authored distances tend to
+   * be generous; trimming them to the room the lamp actually hangs in both
+   * reduces through-wall spill for unshadowed spots and improves shadow-map
+   * depth precision for shadowed ones. Cached per fixture (see below).
+   */
+  private fixtureRange(f: LightFixture, y: number, angle: number, dirY: number): number {
+    if (!this.world) return f.dist;
+    // Position/angle/authored distance are static per fixture and the level
+    // geometry is static, so the trimmed cutoff never changes: probe once.
+    const cachedRange = this.fixtureRangeCache.get(f);
+    if (cachedRange !== undefined) return cachedRange;
+    let result = f.dist;
+    let maxHit = 0;
+    const tilt = angle * 0.82;
+    const horizontal = Math.sin(tilt);
+    const vertical = dirY * Math.cos(tilt);
+    for (let s = 0; s < 5; s++) {
+      let dx = 0;
+      let dy = dirY;
+      let dz = 0;
+      if (s > 0) {
+        const a = (s - 1) * Math.PI * 0.5 + 0.6;
+        dx = Math.cos(a) * horizontal;
+        dy = vertical;
+        dz = Math.sin(a) * horizontal;
+      }
+      const hit = this.world.raycast(f.x, y, f.z, dx, dy, dz, f.dist);
+      if (hit === Infinity) {
+        maxHit = -1;
+        break;
+      }
+      if (hit > maxHit) maxHit = hit;
+    }
+    if (maxHit >= 0) result = clamp(maxHit * 1.12 + 1.25, 5, f.dist);
+    this.fixtureRangeCache.set(f, result);
+    return result;
+  }
+
+  /**
+   * Assigns the pool to the nearest fixtures and animates flicker. Unshadowed
+   * assignments are stable, so fixtures swapping distance rank do not churn
+   * pool slots for an identical final image. The shadowed prefix is rank-
+   * canonical and, importantly, `castShadow` itself was fixed on that prefix
+   * when the pool was constructed; this method never flips it on a live light.
+   */
+  private updateFixtureLights(dt: number) {
+    const budget = this.fixtureBudgetFor(this.settings);
+    const maxDist = this.fixtureMaxDistanceFor(this.settings);
+    if (!budget) {
+      for (const l of this.fixtureLights) l.visible = false;
+      this.fixtureBudget = 0;
+      this.fixtureMaxDist = maxDist;
+      return;
+    }
+    const shadowCount = this.fixtureShadowSlotsFor(this.settings);
+    if (shadowCount !== this.fixtureShadowSlots) {
+      // A different fixed shadow prefix requires new light objects. This is
+      // a settings-change path, not a per-frame toggle: setup resets the
+      // assignment state below and this same call repopulates it.
+      this.setupFixtureLights(shadowCount);
+    }
+    if (budget <= 14 && this.fixtureLights.length > 14) {
+      // Dropping back into the ordinary per-light range should not leave
+      // hundreds of invisible batched-pool objects in the scene graph. While
+      // the limit remains above 14 (or Unlimited), retain the grown pool for
+      // reuse instead of rebuilding it on every slider decrement.
+      this.setupFixtureLights(shadowCount);
+    }
+    const fixtures = this.fixtureList();
+    const cam = this.camera.position;
+    this.fixtureT -= dt;
+    const moved =
+      (cam.x - this.fixtureSortX) ** 2 +
+      (cam.y - this.fixtureSortY) ** 2 +
+      (cam.z - this.fixtureSortZ) ** 2;
+    // 6.25 = (2.5 m)². The old 1.5 m trigger re-ranked almost continuously
+    // while sprinting, on top of the 0.3 s timer; rank hysteresis below
+    // already keeps near-ties from churning pool slots between re-ranks.
+    if (this.fixtureT <= 0 || moved > 6.25 || this.fixtureBudget !== budget || this.fixtureMaxDist !== maxDist) {
+      this.fixtureT = 0.3;
+      this.fixtureSortX = cam.x;
+      this.fixtureSortY = cam.y;
+      this.fixtureSortZ = cam.z;
+      for (const o of this.fixtureOrder) {
+        const f = fixtures[o.i];
+        // Small hysteresis for fixtures selected by the previous sort: two
+        // lamps at nearly equal distance should not trade pool/shadow slots
+        // every 0.3 s as the camera crosses their midpoint.
+        const prevRank = this.fixtureRankByIndex[o.i] ?? 999;
+        const bias = prevRank < shadowCount ? 0.88 : prevRank < budget ? 0.94 : 1;
+        // Distance is to the closest point on a grouped neon segment, not
+        // its centre, so a long strip passing beside the player is ranked by
+        // its nearby section. Authored lamps/pads retain priority at equal
+        // distance.
+        const priority = f.kind === 'fixture' ? 0.48 : f.kind === 'pad' ? 0.78 : 1.12;
+        const closest = this.closestEmitterPoint(f, cam.x, cam.y, cam.z, this.fixtureClosest);
+        const dx = closest.x - cam.x;
+        const dy = closest.y - cam.y;
+        const dz = closest.z - cam.z;
+        const dx2 = dx * dx;
+        const dy2 = dy * dy;
+        const dz2 = dz * dz;
+        o.r2 = dx2 + dy2 + dz2;
+        o.d = (dx2 + dz2 + dy2 * 0.18) * bias * priority;
+      }
+      this.fixtureOrder.sort((a, b) => a.d - b.d);
+      const uncapped = budget === Infinity;
+      // DynamicLighting's spot batch is a 768-entry uniform allocation (plus
+      // the separately rendered shadowed prefix). That is a GPU allocation
+      // limit, not the old 14-light quality budget; representative shipped
+      // vistas select fewer relevant grouped segments than this.
+      const desired = uncapped ? Math.min(fixtures.length, 768 + shadowCount) : Math.min(budget, fixtures.length);
+      if (uncapped) this.camera.updateMatrixWorld();
+      this.fixtureSelected.fill(false);
+      this.fixtureUsed.fill(false);
+      this.fixtureRankByIndex.fill(999);
+      this.fixtureSelectedOrder.length = 0;
+      const maxDist2 = maxDist * maxDist;
+      // Raycast in distance order. The user's max-distance cutoff is checked
+      // against the closest point of each source (so a long neon segment is
+      // active when any part of it is in range; the weighted sort key is not
+      // monotonic in true distance, hence `continue`, not `break`). Finite
+      // limits stop once the pool is full, so fully occluded lamps/segments
+      // never consume a slot. Unlimited has no ranked count limit: candidates
+      // are filtered by whether they can affect the current view (in/near the
+      // frustum, or close enough that their own cone can reach in front of
+      // the camera), then by real raycast occlusion. Neon segments are
+      // probed along their length; points also get a cone sample.
+      for (const o of this.fixtureOrder) {
+        if (this.fixtureSelectedOrder.length >= desired) break;
+        if (o.r2 > maxDist2) continue;
+        const f = fixtures[o.i];
+        if (uncapped && o.r2 > (f.dist + 3) * (f.dist + 3)) {
+          const bx = f.x2 ?? f.x;
+          const by = f.y2 ?? f.y;
+          const bz = f.z2 ?? f.z;
+          const ax = f.x2 === undefined ? f.x : 2 * f.x - bx;
+          const ay = f.y2 === undefined ? f.y : 2 * f.y - by;
+          const az = f.z2 === undefined ? f.z : 2 * f.z - bz;
+          if (!this.projectEmitterSegment(ax, ay, az, bx, by, bz, this.camera) || this.flareRadial > 1.35) continue;
+        }
+        const neonSamples = f.kind !== 'neon' ? 1 : (f.stripLength ?? 0) > 60 ? 7 : (f.stripLength ?? 0) > 25 ? 5 : 3;
+        if (this.emitterVisibility(f, neonSamples, true, true) <= 0) continue;
+        this.fixtureSelected[o.i] = true;
+        this.fixtureRankByIndex[o.i] = this.fixtureSelectedOrder.length;
+        this.fixtureSelectedOrder.push(o.i);
+      }
+      const count = this.fixtureSelectedOrder.length;
+      this.ensureFixturePool(count);
+      this.fixtureNext.fill(-1);
+      const canonical = Math.min(shadowCount, count);
+      for (let k = 0; k < canonical; k++) {
+        const fi = this.fixtureSelectedOrder[k];
+        this.fixtureNext[k] = fi;
+        this.fixtureUsed[fi] = true;
+      }
+      for (let k = canonical; k < count; k++) {
+        const fi = this.fixtureAssign[k] ?? -1;
+        if (fi >= 0 && this.fixtureSelected[fi] && !this.fixtureUsed[fi]) {
+          this.fixtureNext[k] = fi;
+          this.fixtureUsed[fi] = true;
+        }
+      }
+      let oi = 0;
+      for (let k = 0; k < count; k++) {
+        if (this.fixtureNext[k] >= 0) continue;
+        while (oi < count && this.fixtureUsed[this.fixtureSelectedOrder[oi]]) oi++;
+        if (oi >= count) break;
+        const fi = this.fixtureSelectedOrder[oi];
+        this.fixtureNext[k] = fi;
+        this.fixtureUsed[fi] = true;
+      }
+      for (let k = 0; k < this.fixtureLights.length; k++) {
+        const fi = this.fixtureNext[k] ?? -1;
+        this.fixtureRank[k] = fi >= 0 ? this.fixtureRankByIndex[fi] : 999;
+        if (fi !== this.fixtureAssign[k]) {
+          this.fixtureAssign[k] = fi;
+          this.fixturePropDirty[k] = true;
+          this.fixtureShadowDirty[k] = true;
+        }
+      }
+      this.fixtureBudget = budget;
+      this.fixtureMaxDist = maxDist;
+    }
+
+    // The nearest fixtures cast static wall shadows at every coloured-light
+    // tier (not just Reference). Six to eight 384² maps bound the sampler and
+    // shader cost; farther spots still have a directional cone plus the
+    // raycast-trimmed cutoff above, so their spill cannot travel across a map.
+    for (let k = 0; k < this.fixtureLights.length; k++) {
+      const l = this.fixtureLights[k];
+      const fi = this.fixtureAssign[k] ?? -1;
+      const f = fi >= 0 ? fixtures[fi] : null;
+      if (!f) {
+        l.visible = false;
+        continue;
+      }
+      l.visible = true;
+      if (this.fixturePropDirty[k]) {
+        const dirY = (f.dirY ?? -1) < 0 ? -1 : 1;
+        const y = f.y + dirY * 0.22;
+        const angle = clamp(f.angle ?? 1.02, 0.38, 1.42);
+        let range = this.fixtureRange(f, y, angle, dirY);
+        if (f.kind === 'neon') {
+          // The grouped source must reach toward the ends of its segment,
+          // not just the first surface found below the segment centre.
+          range = clamp(Math.max(range, Math.min(f.dist, (f.stripLength ?? 0) * 0.6 + 7)), 5, f.dist);
+        }
+        l.position.set(f.x, y, f.z);
+        const outwardTilt = f.kind === 'neon' ? 2.2 : 0;
+        l.target.position.set(f.x + (f.nx ?? 0) * outwardTilt, y + dirY * 5, f.z + (f.nz ?? 0) * outwardTilt);
+        l.target.updateMatrixWorld();
+        l.color.setHex(f.color);
+        l.angle = angle;
+        l.penumbra = f.kind === 'neon' ? 0.85 : 0.5;
+        l.decay = 1.45;
+        l.distance = range;
+        l.shadow.camera.near = 0.35;
+        l.shadow.camera.far = Math.max(2, range);
+        l.shadow.camera.updateProjectionMatrix();
+        const texel = (2 * Math.tan(angle) * range) / Math.max(1, l.shadow.mapSize.x);
+        l.shadow.normalBias = clamp(texel * 0.65, 0.02, 0.13);
+        l.shadow.bias = -0.00012;
+        this.fixturePropDirty[k] = false;
+        this.fixtureShadowDirty[k] = true;
+      }
+      if (l.castShadow && this.fixtureShadowDirty[k]) {
+        l.shadow.needsUpdate = true;
+        this.fixtureShadowDirty[k] = false;
+      }
+      const fl = f.flicker ?? 0;
+      const flick = fl > 0 ? 1 - fl * 0.28 * (0.5 + 0.5 * Math.sin(this.time * 11 + fi * 2.7) * Math.sin(this.time * 5.3 + fi)) : 1;
+      // Three's physical spot falloff made the TSL-era 1.15× authored values
+      // nearly invisible under the sun/hemisphere rig, especially once the
+      // reflective level material became partly metallic. 1.9× restores a
+      // clear coloured pool at fixture distance without returning to omni lights.
+      l.intensity = f.intensity * 1.9 * flick;
+    }
+  }
+
+  /** Builds a PMREM environment from the current theme (IBL reflections) on demand. */
+  private buildEnvironment() {
+    if (!this.rendererReady || this.disposed) return;
+    const th = this.level.theme;
+    // Inputs are exactly the theme colours + base sun direction used below.
+    const envKey = `${th.skyTop}|${th.skyBottom}|${th.ground}|${th.sunColor}|${th.accent}|${this.sunBase.x.toFixed(4)},${this.sunBase.y.toFixed(4)},${this.sunBase.z.toFixed(4)}`;
+    const cachedEnv = this.envCache.get(envKey);
+    if (cachedEnv) {
+      // Refresh LRU order and reuse the earlier PMREM render as-is.
+      this.envCache.delete(envKey);
+      this.envCache.set(envKey, cachedEnv);
+      this.envRT = cachedEnv;
+      this.scene.environment = cachedEnv.texture;
+      return;
+    }
+    if (!this.pmrem) this.pmrem = new THREE.PMREMGenerator(this.renderer);
+    const scene = new THREE.Scene();
+    const geo = new THREE.SphereGeometry(50, 24, 16);
+    const cols = new Float32Array(geo.attributes.position.count * 3);
+    const top = new THREE.Color(th.skyTop);
+    const bot = new THREE.Color(th.skyBottom);
+    const gnd = new THREE.Color(th.ground);
+    const tmp = new THREE.Color();
+    for (let i = 0; i < geo.attributes.position.count; i++) {
+      const y = geo.attributes.position.getY(i) / 50;
+      if (y >= 0) tmp.copy(bot).lerp(top, Math.pow(Math.min(1, y * 1.5), 0.7));
+      else tmp.copy(bot).lerp(gnd, Math.min(1, -y * 2.5));
+      cols[i * 3] = tmp.r; cols[i * 3 + 1] = tmp.g; cols[i * 3 + 2] = tmp.b;
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(cols, 3));
+    const skyM = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide }));
+    scene.add(skyM);
+    // Hot sun card so reflective surfaces pick up a directional highlight. Its
+    // radius matches the visible disc's angular size (disc ≈ 86 units at 480,
+    // i.e. ~5.1° half-angle → tan(5.1°)·42 ≈ 3.8 here), with the intensity
+    // raised to keep roughly the same total energy in the smaller card.
+    const sunM = new THREE.Mesh(
+      new THREE.CircleGeometry(3.8, 20),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(th.sunColor).multiplyScalar(14), side: THREE.DoubleSide }),
+    );
+    sunM.position.copy(this.sunBase).multiplyScalar(42);
+    sunM.lookAt(0, 0, 0);
+    scene.add(sunM);
+    const accentM = new THREE.Mesh(
+      new THREE.PlaneGeometry(46, 4),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(th.accent).multiplyScalar(1.6), side: THREE.DoubleSide }),
+    );
+    accentM.position.set(0, 2, -40);
+    scene.add(accentM);
+    const rt = this.pmrem.fromScene(scene, 0.05);
+    skyM.geometry.dispose();
+    (skyM.material as THREE.Material).dispose();
+    sunM.geometry.dispose();
+    (sunM.material as THREE.Material).dispose();
+    accentM.geometry.dispose();
+    (accentM.material as THREE.Material).dispose();
+    this.envCache.set(envKey, rt);
+    // Keep at most four environments (each is a small PMREM cube chain);
+    // evicting disposes the least-recently-used one, never the live RT
+    // (it was just inserted/refreshed at the newest end).
+    while (this.envCache.size > 4) {
+      const oldest = this.envCache.keys().next().value as string;
+      this.envCache.get(oldest)?.dispose();
+      this.envCache.delete(oldest);
+    }
+    this.envRT = rt;
+    this.scene.environment = rt.texture;
+  }
+
+  private setEnvironment(on: boolean) {
+    // SSR only sees what is on screen. Without an IBL fallback, grazing ground
+    // pixels whose reflected ray leaves the frame (or points behind the camera)
+    // return black and read as an empty circle in front of the player — so SSR
+    // forces the environment on even if the IBL toggle itself is off.
+    const ssrOn = this.settings.post && this.settings.ssr > 0;
+    const effective = on || ssrOn;
+    if (effective) {
+      if (!this.envRT) this.buildEnvironment();
+      if (this.envRT) this.scene.environment = this.envRT.texture;
+    } else {
+      this.scene.environment = null;
+    }
+    this.levelObjs.setSurface(effective, ssrOn ? 0.42 : 0.85);
+  }
+
   applySettings(s: Settings) {
     this.settings = s;
+    // Lazily install Three's batched analytic-light path the first time a
+    // coloured-light limit above 14 (or Unlimited) is requested on WebGPU.
+    // Unshadowed spots/points then live in uniform arrays with a live count,
+    // so expanding the fixture pool does not recompile materials per count.
+    // Shadow-casting lights (sun + fixture prefix) automatically keep the
+    // default per-light path. 768 spot entries use ~48 KiB of the shared
+    // render uniform buffer, safely below WebGPU's 64 KiB minimum limit
+    // alongside the camera/fog/shadow uniforms.
+    if (this.dynamicFixtureLighting && this.coloredLightsWantDynamicBatch(s) && !this.dynamicLightingInstalled) {
+      this.renderer.lighting = new DynamicLighting({
+        maxDirectionalLights: 4,
+        maxPointLights: 16,
+        maxSpotLights: 768,
+        maxHemisphereLights: 4,
+      });
+      this.dynamicLightingInstalled = true;
+      const markMaterials = (o: THREE.Object3D) => {
+        const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
+        if (m) (Array.isArray(m) ? m : [m]).forEach((x) => (x.needsUpdate = true));
+      };
+      this.scene.traverse(markMaterials);
+      this.wScene.traverse(markMaterials);
+    }
+    // Fixture castShadow flags are immutable after pool construction. If a
+    // discrete coloured-light/shadow setting change requires another fixed
+    // shadow prefix, rebuild the lights here rather than toggling live ones.
+    // (Budget 0 can leave the invisible pool as-is; updateFixtureLights will
+    // rebuild on re-enable if its prefix is stale.)
+    const fixtureShadowSlots = this.fixtureShadowSlotsFor(s);
+    if (this.fixtureBudgetFor(s) > 0 && fixtureShadowSlots !== this.fixtureShadowSlots) {
+      this.setupFixtureLights(fixtureShadowSlots);
+    }
     const r = this.renderer;
     const enabled = s.shadows > 0;
     if (r.shadowMap.enabled !== enabled) {
@@ -546,51 +1660,119 @@ export class Engine {
       r.shadowMap.type = stype;
       this.sun.shadow.map?.dispose();
       this.sun.shadow.map = null;
+      this.fixtureShadowDirty.fill(true);
       this.scene.traverse((o) => {
         const m = (o as THREE.Mesh).material as THREE.Material | THREE.Material[] | undefined;
         if (m) (Array.isArray(m) ? m : [m]).forEach((x) => (x.needsUpdate = true));
       });
     }
-    this.sun.shadow.radius = s.shadowSoftness === 2 ? 6 : s.shadowSoftness === 1 ? 2.5 : 1;
-    this.sun.shadow.blurSamples = 10;
-    this.sun.shadow.bias = s.shadowSoftness === 2 ? -0.0002 : -0.0005;
+    // Shadow radius/bias are computed below from the actual texel size so the
+    // penumbra is a constant world-space width at every shadow resolution.
     this.sun.castShadow = enabled;
     this.sun.shadow.autoUpdate = false;
-    this.sun.shadow.needsUpdate = true;
-    this.sunDirty = true;
+    // applySettings runs for every slider movement, audio included. Only a
+    // shadow tier/softness change can invalidate the sun shadow map here;
+    // camera motion, theme and level changes mark it dirty on their own
+    // paths (followSun / applyThemeOnly / setMapOrTheme).
+    const sunShadowKey = `${s.shadows}|${s.shadowSoftness}`;
+    if (sunShadowKey !== this.sunShadowKey) {
+      this.sunShadowKey = sunShadowKey;
+      this.sun.shadow.needsUpdate = true;
+      this.sunDirty = true;
+    }
     r.toneMappingExposure = s.exposure;
-    if (s.post && !this.post) this.post = new PostPipeline(r, s.antialias);
-    else if (!s.post && this.post) {
+    // FXAA/SMAA/TAA live inside the HDR pipeline, so they implicitly enable it
+    const aa = aaModeOf(s);
+    const needPost = s.post || aa === 'fxaa' || aa === 'smaa' || aa === 'taa';
+    // screen-space effects belong to the post toggle even when the pipeline itself is forced on by AA
+    const postOpts = {
+      aa,
+      ssaaScale: s.ssaaScale,
+      // Do not compile (or pay for) Bloom/Godrays when their amounts are off.
+      // Their quality settings remain genuine Fast/Balanced/Quality tiers.
+      bloom: s.post && s.bloom > 0.001,
+      bloomQuality: s.bloomQuality,
+      godRays: s.post && s.godRays > 0.001,
+      raysQuality: s.raysQuality,
+      ao: s.post ? s.ao : 0 as const,
+      ssr: s.post ? s.ssr : 0 as const,
+      dof: s.post ? s.dof : 0,
+      shadows: enabled,
+      shadowType: stype,
+      flare: s.post ? s.flare > 0 : false,
+      chromatic: s.post ? s.chromatic : false,
+      sharpen: s.post ? s.sharpen > 0 : false,
+      colorGrade: s.post ? s.colorGrade > 0 : false,
+    };
+    if (needPost && !this.post) {
+      this.post = new PostPipeline(r, this.scene, this.camera, postOpts, this.sun);
+    } else if (!needPost && this.post) {
       this.post.dispose();
       this.post = null;
+    } else if (this.post) {
+      // The TSL pipeline rebuilds its node graph internally when a
+      // graph-affecting option changes; no full reconstruction needed here.
+      this.post.setOptions(postOpts);
     }
-    if (s.dynamicLights !== this.lightsOn) {
-      this.lightsOn = s.dynamicLights;
-      if (this.lightsOn && !this.lights.length) {
-        for (let i = 0; i < 4; i++) {
-          const l = new THREE.PointLight(0xffffff, 0, 16, 1.6);
-          l.visible = true;
-          this.scene.add(l);
-          this.lights.push({ l, t: 0, dur: 1, base: 0 });
-        }
-      } else if (!this.lightsOn) {
-        this.lights.forEach((x) => this.scene.remove(x.l));
-        this.lights = [];
+    // environment reflections / IBL + reflective surface response (SSR forces
+    // the environment on inside setEnvironment as its screen-space fallback)
+    this.setEnvironment(s.envReflections);
+    this.levelObjs.setVolumetric(s.volumetric);
+    const maxAniso = this.maxAnisotropy();
+    this.levelObjs.setAnisotropy(Math.min([1, 4, 8, 16][s.aniso] ?? 8, maxAniso));
+    this.dust?.setDensity([0, 0.45, 1][s.particles]);
+    if (!s.dynamicSun) {
+      this.sun.color.copy(this.sunBaseColor);
+      this.sun.intensity = 3.4;
+    }
+    // transient flash-light pool grows a little with the coloured-light limit
+    const coloredLimit = coloredLightLimitOf(s);
+    const wantLights = !s.dynamicLights ? 0 : coloredLimit < 0 || coloredLimit > 8 ? 8 : coloredLimit > 4 ? 6 : 4;
+    if (wantLights !== this.lights.length) {
+      this.lights.forEach((x) => this.scene.remove(x.l));
+      this.lights = [];
+      for (let i = 0; i < wantLights; i++) {
+        const l = new THREE.PointLight(0xffffff, 0, 16, 1.6);
+        l.visible = true;
+        this.scene.add(l);
+        this.lights.push({ l, t: 0, dur: 1, base: 0 });
       }
     }
-    const size = [512, 512, 1024, 2048][s.shadows];
+    this.lightsOn = s.dynamicLights;
+    const size = [512, 512, 1024, 2048, 4096][s.shadows];
     if (this.sun.shadow.mapSize.x !== size) {
       this.sun.shadow.mapSize.set(size, size);
-      this.sun.shadow.map?.dispose();
-      this.sun.shadow.map = null;
+      // WebGPU's ShadowNode owns and resizes this render target internally.
+      // Disposing/nulling the public pointer here would orphan it (setup only
+      // reassigns `shadow.map` when a new shadow node is built), which is also
+      // the pointer Godrays reads. Just request a redraw at the new size.
+      this.sun.shadow.needsUpdate = true;
     }
-    const half = [30, 30, 38, 46][s.shadows];
+    const half = [30, 30, 38, 46, 62][s.shadows];
+    this.shadowHalf = half;
+    this.shadowSize = size;
+    const texel = (2 * half) / size;
+    // Normal bias ≈ one texel: enough to kill acne without detaching contact
+    // shadows from their casters (the old ~1.7-texel bias made shadow edges
+    // look cut off from the object at high resolutions).
+    this.sun.shadow.normalBias = clamp(texel * 0.9, 0.012, 0.14);
+    this.sun.shadow.bias = s.shadowSoftness === 2 ? -0.00008 : -0.00018;
+    // Penumbra as a world-space width, scaled up toward the large stylised sun
+    // disc (≈10° across): a fixed texel radius got relatively sharper as the
+    // shadow map grew, which no longer matched the sun in the sky.
+    const blurWorld = s.shadowSoftness === 2 ? 0.24 : s.shadowSoftness === 1 ? 0.12 : 0.035;
+    this.sun.shadow.radius = clamp(blurWorld / texel, 1, 10);
+    this.sun.shadow.blurSamples = s.shadowSoftness === 2 ? 16 : 10;
     const sc = this.sun.shadow.camera;
     sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
+    // Tight depth range around the shadow frustum (light sits 100 units out):
+    // better depth precision, fewer edge leaks, than the old fixed 1..240.
+    sc.near = Math.max(1, 100 - (half + 35));
+    sc.far = 100 + half + 35;
     sc.updateProjectionMatrix();
     const fog = this.scene.fog as THREE.Fog;
     const vd = [[18, 110], [30, 190], [45, 330]][s.viewDistance];
-    const haze = 1.6 - s.atmosphere * 1.1;
+    const haze = 1.55 - s.atmosphere * 0.8;
     fog.near = vd[0] * haze;
     fog.far = vd[1] * haze;
     this.pm = [0.4, 0.7, 1][s.particles];
@@ -603,19 +1785,51 @@ export class Engine {
     const w = Math.max(1, this.container.clientWidth);
     const h = Math.max(1, this.container.clientHeight);
     const dpr = Math.min(window.devicePixelRatio || 1, 2);
-    const sc = this.settings.renderScale * this.scaleAdapt;
+    // without the post pipeline, SSAA simply supersamples the drawing buffer itself
+    const ssaaMul = !this.post && aaModeOf(this.settings) === 'ssaa' ? this.settings.ssaaScale : 1;
+    const sc = this.settings.renderScale * this.scaleAdapt * ssaaMul;
     this.renderer.setPixelRatio(1);
-    const bw = Math.floor(w * dpr * sc), bh = Math.floor(h * dpr * sc);
+    let bw = Math.floor(w * dpr * sc), bh = Math.floor(h * dpr * sc);
+    // Clamp to 8192 — the minimum maxTextureDimension2D WebGPU guarantees (the
+    // node renderer has no legacy capabilities.maxTextureSize). When the TSL
+    // pipeline supersamples internally (SSAA pass resolution scale), the
+    // effective target is larger than the drawing buffer, so include it.
+    const internalScale = this.post && aaModeOf(this.settings) === 'ssaa' ? this.settings.ssaaScale : 1;
+    const fit = Math.min(1, 8192 / (Math.max(1, bw, bh) * internalScale));
+    if (fit < 1) {
+      bw = Math.max(1, Math.floor(bw * fit));
+      bh = Math.max(1, Math.floor(bh * fit));
+    }
+    const aspect = w / h;
+    // applySettings() calls resize() for every settings change, including
+    // audio sliders. Reassigning an unchanged drawing-buffer size can reset
+    // the canvas surface, so only touch the renderer/cameras on a real change.
+    if (bw === this.bufferW && bh === this.bufferH) {
+      // Cheap and keeps a just-created pipeline's aspect uniform correct.
+      this.post?.setSize(bw, bh);
+      if (Math.abs(aspect - this.viewAspect) > 0.0001) {
+        this.viewAspect = aspect;
+        this.camera.aspect = aspect;
+        this.camera.updateProjectionMatrix();
+        this.wCam.aspect = aspect;
+        this.wCam.updateProjectionMatrix();
+      }
+      return;
+    }
+    this.bufferW = bw;
+    this.bufferH = bh;
+    this.viewAspect = aspect;
     this.renderer.setSize(bw, bh, false);
     this.post?.setSize(bw, bh);
-    this.camera.aspect = w / h;
+    this.camera.aspect = aspect;
     this.camera.updateProjectionMatrix();
-    this.wCam.aspect = w / h;
+    this.wCam.aspect = aspect;
     this.wCam.updateProjectionMatrix();
   }
 
   private adapt() {
-    if (!this.settings.adaptive || this.state !== 'playing') {
+    // adaptive resolution would silently change the workload mid-benchmark
+    if (!this.settings.adaptive || this.state !== 'playing' || this.benchActive) {
       this.lowFpsT = 0;
       this.highFpsT = 0;
       return;
@@ -630,8 +1844,7 @@ export class Engine {
           this.lowQuality = true;
           this.fx.particles.cap = Math.min(this.fx.particles.cap, 320);
           this.sun.shadow.mapSize.set(512, 512);
-          this.sun.shadow.map?.dispose();
-          this.sun.shadow.map = null;
+          this.sun.shadow.needsUpdate = true;
         }
         this.resize();
       }
@@ -689,7 +1902,8 @@ export class Engine {
         }
       } else {
         this.input.releaseAll();
-        if (this.state === 'playing' && !this.touch) this.pause();
+        // the benchmark deliberately runs unlocked; losing the lock must not pause it
+        if (this.state === 'playing' && !this.touch && !this.benchActive) this.pause();
       }
     }) as EventListener);
     this.on(document, 'pointerlockerror', (() => this.onLockError()) as EventListener);
@@ -787,6 +2001,7 @@ export class Engine {
   deploy() {
     audio.init();
     audio.startMusic();
+    this.cancelBenchmark();
     this.startMatch();
     this.requestPlay();
   }
@@ -824,6 +2039,7 @@ export class Engine {
 
   pause() {
     if (this.state !== 'playing') return;
+    this.cancelBenchmark();
     this.input.releaseAll();
     this.boardOpen = false;
     this.handlers.onEvent({ type: 'scoreboard', show: false });
@@ -842,9 +2058,13 @@ export class Engine {
     this.hemi.color.setHex(th.hemiSky);
     this.hemi.groundColor.setHex(th.hemiGround);
     this.sun.color.setHex(th.lightColor);
+    this.sunBaseColor.setHex(th.lightColor);
+    if (!this.settings.dynamicSun) this.sun.intensity = 3.4;
     this.sunDir.set(th.sunDir[0], th.sunDir[1], th.sunDir[2]).normalize();
     this.sunBase.copy(this.sunDir);
     this.rayCol.setHex(th.sunColor);
+    this.dust?.setTint(th.sunColor);
+    if (this.settings.envReflections || (this.settings.post && this.settings.ssr > 0)) this.buildEnvironment();
     // recolors the baked vertex colors of the level boxes / glow, not just the emissive tint
     if (recolorLevel) this.levelObjs.applyTheme(th);
     // the light direction changed: reposition the sun even if the player did not move
@@ -881,8 +2101,13 @@ export class Engine {
     }
     this.scene.remove(this.levelObjs.group);
     this.levelObjs.dispose();
-    this.levelObjs = buildLevelObjects(next, this.renderer.capabilities.getMaxAnisotropy());
+    this.levelObjs = buildLevelObjects(next, this.maxAnisotropy());
     this.scene.add(this.levelObjs.group);
+    this.setupFixtureLights();
+    this.vistaCurve = next.vista?.length ? new THREE.CatmullRomCurve3(next.vista.map((p) => new THREE.Vector3(p[0], p[1], p[2])), true, 'centripetal') : null;
+    this.vistaLookCurve = next.vistaLook?.length === next.vista?.length && next.vistaLook ? new THREE.CatmullRomCurve3(next.vistaLook.map((p) => new THREE.Vector3(p[0], p[1], p[2])), true, 'centripetal') : null;
+    // re-apply quality-dependent level state (anisotropy, volumetrics, surface, env) to the new meshes
+    this.applySettings(this.settings);
     this.world = new World(next.boxes);
     this.nav = new Nav(this.world, next.w, next.d);
     this.map = renderLevelMap(next, 256);
@@ -916,6 +2141,7 @@ export class Engine {
 
   restart() {
     audio.init();
+    this.cancelBenchmark();
     this.startMatch();
     // If we already own the pointer (or are unlocked/touch), go straight back in — asking for the
     // lock again would emit no event and leave the round frozen behind a playing state.
@@ -925,6 +2151,89 @@ export class Engine {
     }
     this.state = 'paused';
     this.requestPlay();
+  }
+
+  /** True on the graphics showcase level (the only map with a vista/benchmark path). */
+  get isShowcase(): boolean {
+    return !!this.vistaCurve;
+  }
+
+  /**
+   * Runs the benchmark: a fixed cinematic loop over the showcase level while the bots fight,
+   * sampling true frame times. Adaptive resolution is suspended so the numbers stay honest.
+   */
+  startBenchmark(duration = 30) {
+    if (!this.vistaCurve || this.benchActive || this.rendererFailed) return;
+    audio.init();
+    if (this.state === 'intro' || this.state === 'over') this.startMatch();
+    if (this.warmup) this.startRound();
+    this.benchActive = true;
+    this.benchT = 0;
+    this.benchDur = Math.max(8, duration);
+    this.benchFrames = [];
+    this.benchCalls = 0;
+    this.benchTris = 0;
+    this.benchPrevNoLock = this.noLock;
+    this.noLock = true;
+    this.input.releaseAll();
+    if (document.pointerLockElement === this.canvas) document.exitPointerLock();
+    this.setState('playing');
+    this.emit({ type: 'announce', text: 'BENCHMARK RUNNING', sub: 'Flying the showcase loop — settings are measured as-is', tone: 'info' });
+  }
+
+  cancelBenchmark() {
+    if (!this.benchActive) return;
+    this.benchActive = false;
+    this.noLock = this.benchPrevNoLock;
+    this.input.releaseAll();
+  }
+
+  private updateBenchCamera() {
+    if (!this.vistaCurve) return;
+    const t = (this.benchT / this.benchDur) % 1;
+    this.vistaCurve.getPointAt(t, this.camera.position);
+    if (this.vistaLookCurve) this.vistaLookCurve.getPointAt(t, this.tmpV);
+    else this.vistaCurve.getPointAt((t + 0.02) % 1, this.tmpV);
+    this.camera.lookAt(this.tmpV);
+    this.camera.fov = 66;
+    this.camera.updateProjectionMatrix();
+    this.followSunView();
+    this.input.releaseAll();
+  }
+
+  private finishBenchmark() {
+    if (!this.benchActive) return;
+    this.benchActive = false;
+    this.noLock = this.benchPrevNoLock;
+    const frames = this.benchFrames;
+    this.benchFrames = [];
+    if (frames.length > 10) {
+      const sorted = [...frames].sort((a, b) => a - b);
+      const avgMs = frames.reduce((a, b) => a + b, 0) / frames.length;
+      const pct = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))];
+      const low1Fps = 1000 / pct(0.99);
+      const avgFps = 1000 / avgMs;
+      const verdict =
+        avgFps >= 110 && low1Fps >= 55 ? 'Reference-ready — this device holds maximum fidelity with room to spare.'
+        : avgFps >= 60 && low1Fps >= 38 ? 'Smooth — these settings are a good match for this device.'
+        : avgFps >= 38 ? 'Playable, but tight — consider the Ultra preset or adaptive resolution.'
+        : 'Too heavy for this device — drop to High/Ultra for matches.';
+      this.handlers.onBenchmark?.({
+        avgFps: Math.round(avgFps),
+        low1Fps: Math.round(low1Fps),
+        low01Fps: Math.round(1000 / pct(0.999)),
+        minFps: Math.round(1000 / sorted[sorted.length - 1]),
+        maxFps: Math.round(1000 / Math.max(0.01, sorted[0])),
+        avgMs: Math.round(avgMs * 100) / 100,
+        frames: frames.length,
+        duration: this.benchDur,
+        drawCalls: this.benchCalls,
+        triangles: this.benchTris,
+        resolution: `${this.canvas.width}×${this.canvas.height}`,
+        verdict,
+      });
+    }
+    if (this.state === 'playing') this.pause();
   }
 
   getScoreboard(): ScoreRow[] {
@@ -940,12 +2249,19 @@ export class Engine {
 
   dispose() {
     this.disposed = true;
+    this.benchActive = false;
     cancelAnimationFrame(this.raf);
     for (const [t, type, fn, opt] of this.listeners) t.removeEventListener(type, fn, opt);
     this.listeners = [];
     this.ro?.disconnect();
     if (document.pointerLockElement === this.canvas) document.exitPointerLock();
     this.post?.dispose();
+    this.dust?.dispose();
+    this.scene.environment = null;
+    for (const rt of this.envCache.values()) rt.dispose();
+    this.envCache.clear();
+    this.envRT = null;
+    this.pmrem?.dispose();
     this.levelObjs.dispose();
     this.fighters.forEach((f) => f.view?.dispose());
     this.disposePickups();
@@ -960,9 +2276,10 @@ export class Engine {
     (this.fx.decals.mesh.material as THREE.MeshBasicMaterial).map?.dispose();
     this.fx.blasts.dispose();
     this.wScene.traverse(freeObject);
-    this.renderer.dispose();
-    // release the WebGL context now: browsers cap live contexts, and players join many matches
-    this.renderer.forceContextLoss();
+    for (const l of this.fixtureLights) l.dispose();
+    // WebGPURenderer disposal is async and has no forceContextLoss(); if init()
+    // is still in flight, startRenderer disposes again once it resolves.
+    void this.renderer.dispose();
     this.canvas.remove();
   }
 
@@ -1393,8 +2710,16 @@ export class Engine {
   private loop = (now: number) => {
     if (this.disposed) return;
     this.raf = requestAnimationFrame(this.loop);
-    const dt = Math.min(0.05, Math.max(0.0001, (now - this.last) / 1000));
+    const rawDt = Math.max(0.0001, (now - this.last) / 1000);
+    const dt = Math.min(0.05, rawDt);
+    this.frameDt = dt;
     this.last = now;
+    // benchmark: sample true (unclamped) frame times after a short warm-up
+    if (this.benchActive) {
+      this.benchT += rawDt;
+      if (this.benchT > 0.75) this.benchFrames.push(rawDt * 1000);
+      if (this.benchT >= this.benchDur) this.finishBenchmark();
+    }
     this.fpsAcc += dt;
     this.fpsFrames++;
     if (this.fpsAcc >= 0.5) {
@@ -1406,6 +2731,11 @@ export class Engine {
     this.time += dt;
     this.step(dt);
     this.render();
+    if (this.benchActive) {
+      const info = this.renderer.info.render;
+      this.benchCalls = Math.max(this.benchCalls, info.calls);
+      this.benchTris = Math.max(this.benchTris, info.triangles);
+    }
   };
 
   private step(dt: number) {
@@ -1418,19 +2748,34 @@ export class Engine {
   }
 
   private introStep(dt: number) {
-    this.introAngle += dt * 0.12;
-    const L = this.level;
-    const rad = Math.max(L.w, L.d) * 0.42;
-    const h = 24 + Math.sin(this.time * 0.2) * 5;
-    this.camera.position.set(Math.cos(this.introAngle) * rad, h, Math.sin(this.introAngle) * rad);
-    this.camera.lookAt(0, 3, 0);
-    this.camera.fov = 70;
-    this.camera.updateProjectionMatrix();
+    if (this.vistaCurve) {
+      // showcase attract mode: slow cinematic loop along the level's vista path
+      const t = (this.time % 80) / 80;
+      this.vistaCurve.getPointAt(t, this.camera.position);
+      if (this.vistaLookCurve) this.vistaLookCurve.getPointAt(t, this.tmpV);
+      else this.vistaCurve.getPointAt((t + 0.02) % 1, this.tmpV);
+      this.camera.lookAt(this.tmpV);
+      this.camera.fov = 66;
+      this.camera.updateProjectionMatrix();
+    } else {
+      this.introAngle += dt * 0.12;
+      const L = this.level;
+      const rad = Math.max(L.w, L.d) * 0.42;
+      const h = 24 + Math.sin(this.time * 0.2) * 5;
+      this.camera.position.set(Math.cos(this.introAngle) * rad, h, Math.sin(this.introAngle) * rad);
+      this.camera.lookAt(0, 3, 0);
+      this.camera.fov = 70;
+      this.camera.updateProjectionMatrix();
+    }
     this.fx.particles.update(dt);
     this.updateSun(dt);
+    this.updateFixtureLights(dt);
+    this.dust?.update(dt, this.camera.position, this.time);
     this.levelObjs.update(this.time, this.camera.position, this.sunDir);
     this.animatePickups(dt);
-    this.followSun(0, 0);
+    // orbit intro looks at the centre from afar; the vista cam is inside the action
+    if (this.vistaCurve) this.followSunView();
+    else this.followSun(0, 0);
   }
 
   private simulate(dt: number, rdt: number) {
@@ -1439,11 +2784,11 @@ export class Engine {
     const p = this.player;
     const playing = this.state === 'playing';
     if (p.alive) {
-      if (playing) this.updatePlayer(rdt);
+      if (playing && !this.benchActive) this.updatePlayer(rdt);
       else this.coastPlayer(dt);
     } else this.updateDead(dt, rdt);
     if (p.spawnProt > 0) p.spawnProt -= dt;
-    if (playing) this.updateWeapon(rdt);
+    if (playing && !this.benchActive) this.updateWeapon(rdt);
     this.rebuildFighterGrid();
     // bots (LOD: near every frame, mid every 3rd, far every 8th). Stop AI immediately once the match ends.
     const cam = this.camera.position;
@@ -1498,6 +2843,8 @@ export class Engine {
     if (playing) this.spawnPendingHorde();
     this.updateRockets(dt);
     this.updateLights(rdt);
+    this.updateFixtureLights(rdt);
+    this.dust?.update(rdt, this.camera.position, this.time);
     this.updateSun(dt);
     this.updatePickups(dt);
     this.fx.particles.update(dt);
@@ -1511,6 +2858,7 @@ export class Engine {
     this.animatePickups(dt);
     this.updateSpecial(dt);
     this.updateCamera(rdt);
+    if (this.benchActive) this.updateBenchCamera();
     this.updateViewmodel(rdt);
     this.updateVfx(rdt);
     if (playing && this.warmup) this.updateWarmup(dt);
@@ -1915,36 +3263,96 @@ export class Engine {
   }
 
   private render() {
+    if (!this.rendererReady || this.rendererFailed) return;
     const r = this.renderer;
     const s = this.settings;
-    const showVM = this.state !== 'intro' && this.player?.alive;
+    const showVM = this.state !== 'intro' && this.player?.alive && !this.benchActive;
     if (this.post) {
       const cam = this.camera;
       cam.getWorldDirection(this.tmpV);
       const facing = this.tmpV.dot(this.sunDir);
-      this.tmpV2.copy(cam.position).addScaledVector(this.sunDir, 400).project(cam);
+      // project the actual sun disc centre (levelMesh places it at cam + sunDir * 480)
+      // so the sun flare originates from the visible disc, not an approximation
+      this.tmpV2.copy(cam.position).addScaledVector(this.sunDir, 480).project(cam);
       this.sunUv.set(this.tmpV2.x * 0.5 + 0.5, this.tmpV2.y * 0.5 + 0.5);
-      const edge = Math.max(Math.abs(this.tmpV2.x), Math.abs(this.tmpV2.y));
-      const vis = facing > 0 ? Math.min(1, facing * 2.2) * Math.max(0, Math.min(1, 2.2 - edge)) : 0;
+      const flareEnabled = s.post && s.flare > 0.001;
+      // Real geometric occlusion from five probes across the stylised disc,
+      // refreshed a few times a second and smoothed. This now gates only the
+      // sun's lens flare: a wall between camera and disc should hide the
+      // ghosts, but it must not switch off volumetric shafts cast by other
+      // geometry that is in view.
+      this.sunOccT -= this.frameDt;
+      if (flareEnabled && this.sunOccT <= 0) {
+        this.sunOccT = 0.1;
+        const cp = cam.position;
+        this.sunRight.set(-this.sunDir.z, 0, this.sunDir.x);
+        if (this.sunRight.lengthSq() < 1e-6) this.sunRight.set(1, 0, 0);
+        else this.sunRight.normalize();
+        this.sunUp.crossVectors(this.sunRight, this.sunDir).normalize();
+        let visible = 0;
+        for (const [ox, oy] of SUN_DISC_SAMPLES) {
+          this.sunSampleDir
+            .copy(this.sunDir)
+            .addScaledVector(this.sunRight, ox * 0.18)
+            .addScaledVector(this.sunUp, oy * 0.18)
+            .normalize();
+          if (this.world.raycast(cp.x, cp.y, cp.z, this.sunSampleDir.x, this.sunSampleDir.y, this.sunSampleDir.z, 400) === Infinity) visible++;
+        }
+        this.sunOccTarget = visible / SUN_DISC_SAMPLES.length;
+      } else if (!flareEnabled) {
+        this.sunOccT = 0;
+        this.sunOccTarget = 0;
+      }
+      this.sunOcc += (this.sunOccTarget - this.sunOcc) * Math.min(1, this.frameDt * 7);
+      // Sun flare is an image of the disc, so it keeps the strict facing,
+      // radial and occlusion gate. Shafts are different: GodraysNode marches
+      // through the sun shadow map along the pixels actually on screen, so
+      // their availability should follow the sun itself, not the projected
+      // disc. Elevation/intensity set the energy and a mild 0.62–1.0 phase
+      // term favours looking sunward without ever making off-screen or
+      // wall-occluded sun positions collapse the effect to zero.
+      const radial = Math.hypot(this.tmpV2.x / 1.08, this.tmpV2.y / 1.14);
+      const flareVis = facing > 0 ? this.sunOcc * smoothstep(0.2, 0.72, facing) * smoothstep(1.22, 0.58, radial) : 0;
+      const phase = 0.62 + 0.38 * clamp(facing * 0.5 + 0.5, 0, 1);
+      const rayStrength =
+        clamp(this.sun.intensity / 3.4, 0.3, 1) * smoothstep(0.04, 0.3, this.sunDir.y) * phase;
+      // Must run while tmpV still holds the camera direction (DoF reuses it).
+      if (flareEnabled) this.updateLocalFlares(cam);
+      // depth-of-field focus follows whatever the crosshair is looking at
+      if (s.dof > 0.01 && (this.frameN & 1) === 0) {
+        let target = 20;
+        if (s.dofAutoFocus) {
+          cam.getWorldDirection(this.tmpV);
+          const cp = cam.position;
+          const t = this.world.raycast(cp.x, cp.y, cp.z, this.tmpV.x, this.tmpV.y, this.tmpV.z, 400);
+          target = t === Infinity ? 90 : clamp(t, 1.2, 300);
+        }
+        this.focusDist += (target - this.focusDist) * Math.min(1, this.frameDt * 7);
+      }
       this.post.render(this.scene, cam, showVM ? this.wScene : null, this.wCam, {
-        bloom: s.bloom, rays: s.godRays, sunUv: this.sunUv, sunVis: vis, rayColor: this.rayCol,
-        vignette: s.vignette ? 0.55 + this.vfx.low * 0.5 : 0,
-        aberration: s.chromatic ? this.vfx.damage * 0.012 + this.vfx.speed * 0.004 : 0,
-        grain: s.filmGrain ? 0.045 : 0, time: this.time,
+        bloom: s.post ? s.bloom : 0, rays: s.post ? s.godRays : 0, sunUv: this.sunUv, sunVis: flareVis, rayStrength, rayColor: this.rayCol, flares: this.flareParams,
+        vignette: s.post && s.vignette ? 0.42 + this.vfx.low * 0.35 : 0,
+        aberration: s.post && s.chromatic ? this.vfx.damage * 0.012 + this.vfx.speed * 0.004 : 0,
+        grain: s.post && s.filmGrain ? 0.03 : 0, time: this.time,
+        focusDist: this.focusDist, dof: s.post ? s.dof : 0, flare: s.post ? s.flare : 0, sharpen: s.sharpen, grade: s.colorGrade,
+        exclude: this.levelObjs.noGBuffer,
       });
       return;
     }
     r.clear();
     r.render(this.scene, this.camera);
-    if (this.state !== 'intro' && this.player.alive) {
+    if (this.state !== 'intro' && this.player.alive && !this.benchActive) {
       r.clearDepth();
       r.render(this.wScene, this.wCam);
     }
   }
 
   private followSun(cx: number, cz: number) {
-    const sx = Math.round(cx / 2) * 2;
-    const sz = Math.round(cz / 2) * 2;
+    // snap the shadow-camera cell to a whole number of shadow texels so edges don't crawl
+    const texel = (2 * this.shadowHalf) / Math.max(1, this.shadowSize);
+    const cell = Math.max(texel, Math.round(2 / texel) * texel);
+    const sx = Math.round(cx / cell) * cell;
+    const sz = Math.round(cz / cell) * cell;
     // Reposition when the shadow cell changes, when the sun animates, or when the theme moved the sun.
     if (sx === this.lastSunX && sz === this.lastSunZ && !this.settings.dynamicSun && !this.sunDirty) return;
     this.lastSunX = sx;
@@ -1955,6 +3363,20 @@ export class Engine {
     this.sun.target.updateMatrixWorld();
     // with shadows off the light still lights the scene, there is just no shadow map to refresh
     if (this.sun.castShadow) this.sun.shadow.needsUpdate = true;
+  }
+
+  /**
+   * Centre the shadow frustum a third of its radius ahead of the camera, so
+   * texel density (and intact contact shadows) land where the player is
+   * looking instead of only around the player body.
+   */
+  private followSunView() {
+    this.camera.getWorldDirection(this.tmpV);
+    const ahead = this.shadowHalf * 0.34;
+    this.followSun(
+      this.camera.position.x + this.tmpV.x * ahead,
+      this.camera.position.z + this.tmpV.z * ahead,
+    );
   }
 
   /* ========================================================= dynamic lights */
@@ -1993,6 +3415,10 @@ export class Engine {
     const b = this.sunBase;
     const elev = Math.max(0.28, b.y + Math.sin(this.sunAngle * 0.7) * 0.18);
     this.sunDir.set(b.x * c - b.z * sn, elev, b.x * sn + b.z * c).normalize();
+    // low sun = warmer and dimmer, high sun = the theme's noon colour
+    const k = clamp((this.sunDir.y - 0.26) / 0.45, 0, 1);
+    this.sun.intensity = lerp(2.1, 3.4, k);
+    this.sun.color.copy(this.warmSun).lerp(this.sunBaseColor, k);
   }
 
   /* ============================================================ host API */
@@ -3081,6 +4507,8 @@ export class Engine {
   /* ================================================================== damage */
   private damage(t: Fighter, amount: number, src: Fighter | null, head: boolean, wid: WeaponId, px: number, py: number, pz: number, dx: number, dy: number, dz: number): boolean {
     if (this.warmup || !t.alive || t.gone || t.spawnProt > 0 || this.over) return false;
+    // the benchmark camera is flying the map — the parked player must not die mid-run
+    if (this.benchActive && t.isPlayer) return false;
     if (src && src !== t && this.teamMode && src.team === t.team) return false;
     if (t.isPlayer && (this.cheats.god || this.cheats.oneHp)) {
       if (this.cheats.oneHp) {
@@ -3430,8 +4858,8 @@ export class Engine {
       cam.updateProjectionMatrix();
     }
     this.vfx.fov = (cam.fov * Math.PI) / 180;
-    // sun follows
-    this.followSun(b.x, b.z);
+    // sun shadow frustum follows the view, not just the body
+    this.followSunView();
     // audio listener awareness via camera orientation is computed in sfxAt
   }
 
@@ -3606,6 +5034,8 @@ export class Engine {
       readyCount: this.fighters.filter((f) => !f.gone && f.ready).length,
       fighterCount: this.fighters.filter((f) => !f.gone).length,
       startIn: this.startIn > 0 ? Math.ceil(this.startIn) : 0,
+      bench: this.benchActive ? clamp(this.benchT / this.benchDur, 0, 1) : -1,
+      benchFps: Math.round(this.fps),
     };
     return h;
   }

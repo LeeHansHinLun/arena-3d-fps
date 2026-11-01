@@ -1,4 +1,26 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import {
+  abs,
+  attribute,
+  cameraPosition,
+  cameraViewMatrix,
+  clamp,
+  dot,
+  float,
+  normalWorldGeometry,
+  normalize,
+  positionWorld,
+  pow,
+  sin,
+  smoothstep,
+  time,
+  uniform,
+  varying,
+  vec3,
+  vec4,
+  vertexColor,
+} from 'three/tsl';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import type { Box, LevelData, Theme } from './levels';
 import { mulberry32 } from './levels';
 
@@ -95,12 +117,66 @@ function gridTextures(aniso: number) {
   h.fillRect(0, 6, S, 2);
   h.fillRect(6, 0, 2, S);
   const emi = new THREE.CanvasTexture(e);
+  // Dedicated *soft* bump heightfield. Reusing the binary emissive grid as a bump map
+  // gives derivative-based bump mapping a 0→1 height step at every tile seam; at grazing
+  // angles that can degenerate the perturbed normal (and any resulting NaN then gets
+  // smeared across the frame by bloom). A smooth, wrap-continuous height ramp is safe.
+  const bcv = document.createElement('canvas');
+  bcv.width = bcv.height = S;
+  const bp = bcv.getContext('2d')!;
+  bp.fillStyle = '#808080';
+  bp.fillRect(0, 0, S, S);
+  const seam = (x0: number, y0: number, x1: number, y1: number, rx: number, ry: number, rw: number, rh: number) => {
+    const gr = bp.createLinearGradient(x0, y0, x1, y1);
+    gr.addColorStop(0, '#2c2c2c');
+    gr.addColorStop(1, '#808080');
+    bp.fillStyle = gr;
+    bp.fillRect(rx, ry, rw, rh);
+  };
+  seam(0, 0, 12, 0, 0, 0, 12, S);
+  seam(S, 0, S - 12, 0, S - 12, 0, 12, S);
+  seam(0, 0, 0, 12, 0, 0, S, 12);
+  seam(0, S, 0, S - 12, 0, S - 12, S, 12);
+  const bump = new THREE.CanvasTexture(bcv);
+  bump.wrapS = bump.wrapT = THREE.RepeatWrapping;
+  bump.colorSpace = THREE.NoColorSpace;
+  bump.anisotropy = aniso;
+  // Roughness variation in the green channel (Three's roughnessMap convention):
+  // panel centres are a little smoother than their worn seams, so sun, fixture
+  // spots and SSR break up across a face instead of behaving like one uniform
+  // slab. This avoids the old trick of making the whole arena metallic just to
+  // get visible reflections.
+  const rcv = document.createElement('canvas');
+  rcv.width = rcv.height = S;
+  const rp = rcv.getContext('2d')!;
+  rp.fillStyle = '#9c9c9c';
+  rp.fillRect(0, 0, S, S);
+  rp.fillStyle = '#828282';
+  rp.fillRect(8, 8, S - 16, S - 16);
+  for (let i = 0; i < 180; i++) {
+    rp.fillStyle = `rgba(${Math.random() < 0.5 ? '40,40,40' : '235,235,235'},${Math.random() * 0.11})`;
+    rp.fillRect(Math.random() * S, Math.random() * S, 2 + Math.random() * 12, 2 + Math.random() * 12);
+  }
+  rp.globalAlpha = 0.85;
+  rp.fillStyle = '#c8c8c8';
+  rp.fillRect(0, 0, S, 7);
+  rp.fillRect(0, S - 7, S, 7);
+  rp.fillRect(0, 0, 7, S);
+  rp.fillRect(S - 7, 0, 7, S);
+  rp.globalAlpha = 1;
+  rp.fillStyle = '#dedede';
+  rp.fillRect(0, 0, S, 2);
+  rp.fillRect(0, 0, 2, S);
+  const rough = new THREE.CanvasTexture(rcv);
+  rough.wrapS = rough.wrapT = THREE.RepeatWrapping;
+  rough.colorSpace = THREE.NoColorSpace;
+  rough.anisotropy = aniso;
   for (const t of [map, emi]) {
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.colorSpace = THREE.SRGBColorSpace;
     t.anisotropy = aniso;
   }
-  return { map, emi };
+  return { map, emi, bump, rough };
 }
 
 export interface LevelObjects {
@@ -112,6 +188,66 @@ export interface LevelObjects {
   sky: THREE.Mesh;
   sun: THREE.Mesh;
   pads: THREE.Group[];
+  /** world position of the sun disc centre (kept in sync by update) — god rays/flare project this exact point */
+  sunPos: THREE.Vector3;
+  /** merged volumetric light cones, or null when the level defines none */
+  cones: THREE.Mesh | null;
+  /** objects that must be hidden while rendering normal/depth G-buffers (sky, sun, additive shells…) */
+  noGBuffer: THREE.Object3D[];
+  setVolumetric: (q: 0 | 1 | 2) => void;
+  setAnisotropy: (n: number) => void;
+  /**
+   * reflective=true lowers roughness/raises metalness so SSR + IBL have something
+   * to reflect. envIntensity is lowered while SSR is active so the PMREM fill does
+   * not double-count the screen-space reflection layer.
+   */
+  setSurface: (reflective: boolean, envIntensity?: number) => void;
+}
+
+/**
+ * Cheap volumetric cone in TSL: brightest looking through the middle of the shaft,
+ * fading down its length. One node graph serves WebGPU (WGSL) and the WebGL2
+ * fallback, so there is no hand-maintained GLSL/WGSL pair. Every term is clamped
+ * before use — this is an additive HDR pass feeding bloom.
+ */
+function createConeMaterial() {
+  const intensity = uniform(1);
+  const vT = varying(attribute('aT', 'float'));
+  const viewDir = normalize(cameraPosition.sub(positionWorld));
+  const rim = clamp(abs(dot(normalize(normalWorldGeometry), viewDir)), 0, 1);
+  // A soft silhouette term hides the cone's hard shell edge against the room,
+  // which is what made the old shell read as a solid object at glancing angles.
+  const body = pow(rim, 1.45).mul(smoothstep(0, 0.38, rim));
+  const fade = pow(clamp(float(1).sub(vT), 0, 1), 1.35);
+  const breathe = float(0.9).add(
+    sin(
+      time.mul(1.3)
+        .add(positionWorld.x.mul(0.31))
+        .add(positionWorld.y.mul(0.77))
+        .add(positionWorld.z.mul(0.27)),
+    ).mul(0.1),
+  );
+  const col = clamp(clamp(vertexColor().rgb, vec3(0), vec3(4)).mul(body).mul(fade).mul(breathe).mul(intensity), vec3(0), vec3(4));
+
+  // Plain (unlit) NodeMaterial rather than MeshBasicNodeMaterial: the basic
+  // material's setupNormal() ignores normalNode. Transparent shells still
+  // overwrite auxiliary MRT attachments in a single-pass MRT pipeline (there
+  // is no per-material opt-out), so write a floor-like world-up normal:
+  // GTAO no longer consumes MRT normals at all (it reconstructs from depth),
+  // and SSR seen through a cone then approximates the floor reflection under
+  // it — cones hang over floors — instead of a cone-shaped hole in the
+  // reflections. The visible shell shading above uses the real geometric
+  // world normal, unaffected by this.
+  const material = new THREE.NodeMaterial();
+  material.colorNode = vec4(col, 1);
+  material.normalNode = vec3(0, 1, 0).transformDirection(cameraViewMatrix);
+  material.transparent = true;
+  material.blending = THREE.AdditiveBlending;
+  material.depthWrite = false;
+  material.side = THREE.DoubleSide;
+  material.fog = false;
+  material.toneMapped = false;
+  return { material, intensity };
 }
 
 export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects {
@@ -122,7 +258,11 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
   const floor: Box = { x0: -level.w / 2, x1: level.w / 2, z0: -level.d / 2, z1: level.d / 2, y0: -1, y1: 0, color: floorColor };
   const geo = boxesGeometry([floor, ...level.boxes], 4);
   const mat = new THREE.MeshStandardMaterial({
-    vertexColors: true, map: tex.map, emissiveMap: tex.emi, emissive: new THREE.Color(th.accent), emissiveIntensity: 0.6, roughness: 0.85, metalness: 0.05,
+    vertexColors: true, map: tex.map, emissiveMap: tex.emi, emissive: new THREE.Color(th.accent), emissiveIntensity: 0.6,
+    roughness: 1.05, roughnessMap: tex.rough, metalness: 0.06,
+    // soft panel-seam bump so seams catch the sun (near-free detail; see gridTextures
+    // for why this is a dedicated smooth heightfield rather than the emissive grid)
+    bumpMap: tex.bump, bumpScale: 0.16,
   });
   const main = new THREE.Mesh(geo, mat);
   main.castShadow = true;
@@ -241,9 +381,45 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
   sun.renderOrder = -9;
   sun.frustumCulled = false;
   group.add(sun);
+  const sunPos = new THREE.Vector3();
+
+  // starfield shell (follows the sky dome; opacity follows how dark the theme sky is)
+  const starGeo = new THREE.BufferGeometry();
+  {
+    const sr = mulberry32(4242);
+    const N = 700;
+    const sp = new Float32Array(N * 3);
+    const sc3 = new Float32Array(N * 3);
+    const cTint = new THREE.Color();
+    for (let i = 0; i < N; i++) {
+      // random point on the upper hemisphere
+      const a = sr() * Math.PI * 2;
+      const y = 0.08 + sr() * 0.92;
+      const rad = Math.sqrt(Math.max(0, 1 - y * y));
+      sp[i * 3] = Math.cos(a) * rad * 675;
+      sp[i * 3 + 1] = y * 675;
+      sp[i * 3 + 2] = Math.sin(a) * rad * 675;
+      cTint.setHSL(0.62 + sr() * 0.12, sr() * 0.5, 0.75 + sr() * 0.25).multiplyScalar(0.5 + sr() * 0.5);
+      sc3[i * 3] = cTint.r; sc3[i * 3 + 1] = cTint.g; sc3[i * 3 + 2] = cTint.b;
+    }
+    starGeo.setAttribute('position', new THREE.BufferAttribute(sp, 3));
+    starGeo.setAttribute('color', new THREE.BufferAttribute(sc3, 3));
+  }
+  const starMat = new THREE.PointsMaterial({ size: 1.9, sizeAttenuation: false, vertexColors: true, transparent: true, opacity: 0.8, fog: false, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+  const stars = new THREE.Points(starGeo, starMat);
+  stars.renderOrder = -9;
+  stars.frustumCulled = false;
+  group.add(stars);
+  const starOpacity = (theme: Theme) => {
+    const c = new THREE.Color(theme.skyTop);
+    const lum = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
+    return Math.max(0.12, Math.min(0.9, 1 - lum * 3.2));
+  };
+  starMat.opacity = starOpacity(th);
 
   // pads
   const pads: THREE.Group[] = [];
+  const padFx: { beam: THREE.Mesh; inn: THREE.Mesh; beamMat: THREE.MeshBasicMaterial }[] = [];
   const padColors: { mat: THREE.MeshBasicMaterial; hex: number }[] = [];
   const discGeo = new THREE.CylinderGeometry(1.5, 1.6, 0.12, 14);
   const innerGeo = new THREE.CylinderGeometry(0.9, 0.9, 0.16, 14);
@@ -264,25 +440,70 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
     g.add(d, inn, beam);
     group.add(g);
     pads.push(g);
+    padFx.push({ beam, inn, beamMat: bMat });
     padColors.push({ mat: dMat, hex: p.color }, { mat: bMat, hex: p.color });
   }
 
+  // volumetric light cones (merged into a single draw call)
+  let cones: THREE.Mesh | null = null;
+  let coneIntensity: { value: number } | null = null;
+  if (level.cones && level.cones.length) {
+    const parts: THREE.BufferGeometry[] = [];
+    const cc = new THREE.Color();
+    for (const cn of level.cones) {
+      const g = new THREE.CylinderGeometry(cn.r0, cn.r1, cn.h, 18, 1, true);
+      g.translate(0, -cn.h / 2, 0); // apex (top) at origin, shaft opening downwards
+      const count = g.attributes.position.count;
+      const col = new Float32Array(count * 3);
+      const aT = new Float32Array(count);
+      cc.setHex(cn.color).multiplyScalar(cn.intensity * 0.55);
+      for (let i = 0; i < count; i++) {
+        col[i * 3] = cc.r; col[i * 3 + 1] = cc.g; col[i * 3 + 2] = cc.b;
+        aT[i] = -g.attributes.position.getY(i) / cn.h;
+      }
+      g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+      g.setAttribute('aT', new THREE.BufferAttribute(aT, 1));
+      g.translate(cn.x, cn.y, cn.z);
+      parts.push(g);
+    }
+    const merged = mergeGeometries(parts);
+    parts.forEach((g) => g.dispose());
+    if (merged) {
+      const cone = createConeMaterial();
+      coneIntensity = cone.intensity;
+      cones = new THREE.Mesh(merged, cone.material);
+      cones.frustumCulled = false;
+      cones.renderOrder = 5;
+      group.add(cones);
+    }
+  }
+
+  const noGBuffer: THREE.Object3D[] = [sky, sun, stars, halo];
+  if (cones) noGBuffer.push(cones);
+  for (const p of padFx) noGBuffer.push(p.beam);
+
   const update = (t: number, cam: THREE.Vector3, sunDir: THREE.Vector3) => {
     sky.position.copy(cam);
-    sun.position.set(cam.x + sunDir.x * 480, cam.y + Math.max(40, sunDir.y * 480 * 0.5), cam.z + sunDir.z * 480);
+    stars.position.copy(cam);
+    // cone animation uses the TSL `time` node, updated by the renderer itself
+    // the disc sits exactly on the sun direction so the light, disc, god rays and flare all agree
+    sun.position.set(cam.x + sunDir.x * 480, cam.y + sunDir.y * 480, cam.z + sunDir.z * 480);
+    sunPos.copy(sun.position);
     sun.lookAt(cam);
-    pads.forEach((g, i) => {
-      const beam = g.getObjectByName('beam') as THREE.Mesh;
-      const inn = g.getObjectByName('inner') as THREE.Mesh;
+    // Direct references instead of a name lookup through every pad group on
+    // each update (the intro camera calls this every frame).
+    for (let i = 0; i < padFx.length; i++) {
+      const p = padFx[i];
       const s = 0.5 + 0.5 * Math.sin(t * 4 + i);
-      (beam.material as THREE.MeshBasicMaterial).opacity = 0.12 + 0.14 * s;
-      beam.scale.set(1 + 0.08 * s, 1, 1 + 0.08 * s);
-      inn.scale.setScalar(0.8 + 0.25 * s);
-    });
+      p.beamMat.opacity = 0.12 + 0.14 * s;
+      p.beam.scale.set(1 + 0.08 * s, 1, 1 + 0.08 * s);
+      p.inn.scale.setScalar(0.8 + 0.25 * s);
+    }
   };
 
   const applyTheme = (nt: Theme) => {
     mat.emissive.setHex(nt.accent);
+    starMat.opacity = starOpacity(nt);
     outerMat.color.setHex(nt.fog).multiplyScalar(0.6);
     // rotate the baked box/glow palette with the theme accent so the arena matches the new sky
     totalHueShift = wrapHue(totalHueShift + wrapHue(hueOf(nt.accent) - hueOf(curTheme.accent)));
@@ -332,10 +553,37 @@ export function buildLevelObjects(level: LevelData, aniso: number): LevelObjects
     });
     tex.map.dispose();
     tex.emi.dispose();
+    tex.bump.dispose();
+    tex.rough.dispose();
     sunTex.dispose();
   };
 
-  return { group, main, dispose, update, applyTheme, sky, sun, pads };
+  const setVolumetric = (q: 0 | 1 | 2) => {
+    if (!cones || !coneIntensity) return;
+    cones.visible = q > 0;
+    coneIntensity.value = q === 2 ? 1.2 : 0.85;
+  };
+  const setAnisotropy = (n: number) => {
+    if (tex.map.anisotropy === n) return;
+    tex.map.anisotropy = n;
+    tex.emi.anisotropy = n;
+    tex.bump.anisotropy = n;
+    tex.rough.anisotropy = n;
+    tex.map.needsUpdate = true;
+    tex.emi.needsUpdate = true;
+    tex.bump.needsUpdate = true;
+    tex.rough.needsUpdate = true;
+  };
+  const setSurface = (reflective: boolean, envIntensity = 0.85) => {
+    // These are multipliers for the roughness map (.51–.87): reflective mode
+    // gives roughly .40–.68 across a panel. Keeping metalness modest preserves
+    // coloured diffuse light, which the old whole-arena 0.38 metalness muted.
+    mat.roughness = reflective ? 0.78 : 1.05;
+    mat.metalness = reflective ? 0.22 : 0.06;
+    mat.envMapIntensity = reflective ? envIntensity : 1;
+  };
+
+  return { group, main, dispose, update, applyTheme, sky, sun, pads, sunPos, cones, noGBuffer, setVolumetric, setAnisotropy, setSurface };
 }
 
 /* --------------------------------------------------------------- 2D top-down map */

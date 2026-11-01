@@ -72,7 +72,7 @@ export function ConnectingOverlay({ server, name, onDone }: { server: ServerInfo
 }
 
 /* --------------------------------------------------------------- deploy */
-export function DeployOverlay({ server, touch, onDeploy }: { server: ServerInfo; touch: boolean; onDeploy: () => void }) {
+export function DeployOverlay({ server, touch, onDeploy, onBenchmark }: { server: ServerInfo; touch: boolean; onDeploy: () => void; onBenchmark?: () => void }) {
   useEffect(() => {
     const k = (e: KeyboardEvent) => {
       if (e.key === 'Enter' || e.code === 'Space') {
@@ -97,6 +97,12 @@ export function DeployOverlay({ server, touch, onDeploy }: { server: ServerInfo;
         <div className="max-w-xl text-xs uppercase tracking-[0.2em] text-white/60">
           {touch ? 'Left thumb: move · Right thumb: look · Slide, dash, peek and double-jump with the buttons' : 'WASD move · Shift sprint · Space jump (tap again mid-air!) · C slide · F dash · Q/E peek · R reload · 1-4 weapons · V ready · T chat'}
         </div>
+        {onBenchmark && (
+          <div onClick={(e) => e.stopPropagation()} className="flex flex-col items-center gap-1.5">
+            <Btn variant="yellow" onClick={onBenchmark}>▶ Run benchmark (30s)</Btn>
+            <div className="text-[10px] uppercase tracking-[0.25em] text-white/45">Cinematic loop with live bots — measures your current graphics settings</div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -115,6 +121,7 @@ export function PauseOverlay({
   onSettings,
   onLeave,
   onHost,
+  onBenchmark,
 }: {
   server: ServerInfo;
   /** the round has not started yet: you are in the warmup ready-up phase */
@@ -129,6 +136,8 @@ export function PauseOverlay({
   onSettings: () => void;
   onLeave: () => void;
   onHost?: () => void;
+  /** showcase level only — runs the benchmark loop */
+  onBenchmark?: () => void;
 }) {
   const fs = () => {
     try {
@@ -158,6 +167,7 @@ export function PauseOverlay({
               </Btn>
             )}
             <Btn size="lg" onClick={onResume}>Resume</Btn>
+            {onBenchmark && <Btn variant="yellow" onClick={onBenchmark}>▶ Run benchmark (30s)</Btn>}
             {onHost && <Btn variant="cyan" onClick={onHost}>★ Host options</Btn>}
             {onRestart && <Btn variant="yellow" onClick={onRestart}>Restart round</Btn>}
             <div className="grid grid-cols-2 gap-2.5">
